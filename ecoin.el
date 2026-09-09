@@ -23,6 +23,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'seq)
 (require 'jsonrpc)
 (require 'url-util)
 (require 'project)
@@ -121,7 +122,11 @@ Without this a server that dies on startup is respawned by every idle
 tick -- one node process per keystroke -- because `ecoin--conn' no longer
 blocks on the handshake and so no longer throttles itself.")
 (defvar ecoin--request-counter 0 "Increases on every completion request.")
-(defvar ecoin--status nil "Last `didChangeStatus' payload from the server.")
+(defvar ecoin--status nil "Last status the server reported, as a plist.")
+(defvar ecoin--status-message nil
+  "Last status message shown, so the same one is not reported twice.")
+(defvar ecoin--status-v2 nil
+  "Non-nil once the server has sent `didChangeStatus/v2'.")
 (defvar ecoin--workspace-folders nil "Folder URIs already announced to the server.")
 
 (defvar-local ecoin--opened nil "Non-nil once didOpen was sent for this buffer.")
@@ -143,13 +148,40 @@ blocks on the handshake and so no longer throttles itself.")
 
 ;;;; Server connection
 
+(defun ecoin--note-status (status)
+  "Record STATUS and report it once when it is an error.
+STATUS is a plist with `:kind', usually a `:message', and -- when it came
+from `didChangeStatus/v2' -- a `:result' holding the sign-in state."
+  (setq ecoin--status status)
+  (let ((msg (plist-get status :message)))
+    (cond
+     ((not (equal (plist-get status :kind) "Error"))
+      (setq ecoin--status-message nil))
+     ;; The server announces one condition through both `didChangeStatus' and
+     ;; `didChangeStatus/v2', so show any given message only once.
+     ((equal msg ecoin--status-message))
+     (t
+      (setq ecoin--status-message msg)
+      (message "ecoin: %s%s" msg
+               (if (equal (plist-get (plist-get status :result) :status)
+                          "NotSignedIn")
+                   "  Run M-x ecoin-login"
+                 ""))))))
+
 (defun ecoin--handle-notification (_conn method params)
   (pcase method
     ('window/logMessage (ecoin--log "%s" (plist-get params :message)))
+    ;; Both shapes describe the same condition and both are sent.  v2 is the
+    ;; detailed one -- split by category, and its `auth' entry carries the
+    ;; sign-in result -- so it wins, and the flat form is kept only for
+    ;; servers old enough not to send v2 at all.
+    ('didChangeStatus/v2
+     (setq ecoin--status-v2 t)
+     (when-let* ((auth (seq-find (lambda (s) (equal (plist-get s :category) "auth"))
+                                 (append (plist-get params :statuses) nil))))
+       (ecoin--note-status auth)))
     ('didChangeStatus
-     (setq ecoin--status params)
-     (when (equal (plist-get params :kind) "Error")
-       (message "ecoin: %s" (plist-get params :message))))))
+     (unless ecoin--status-v2 (ecoin--note-status params)))))
 
 (defun ecoin--handle-request (_conn method params)
   (pcase method
@@ -173,6 +205,9 @@ blocks on the handshake and so no longer throttles itself.")
 (defun ecoin--on-shutdown (_conn)
   (setq ecoin--connection nil
         ecoin--ready nil
+        ecoin--status nil
+        ecoin--status-message nil
+        ecoin--status-v2 nil
         ecoin--workspace-folders nil)
   (dolist (buf (buffer-list))
     (with-current-buffer buf
@@ -230,14 +265,11 @@ flips, `ecoin--conn' reports no connection and callers stay quiet."
      :success-fn
      (lambda (_res)
        (jsonrpc-notify conn :initialized (make-hash-table))
-       (setq ecoin--ready t)
-       (jsonrpc-async-request
-        conn :checkStatus (make-hash-table)
-        :success-fn (lambda (res)
-                      (unless (equal (plist-get res :status) "OK")
-                        (message "ecoin: not signed in (%s). Run M-x ecoin-login"
-                                 (plist-get res :status))))
-        :error-fn #'ignore :timeout-fn #'ignore))
+       (setq ecoin--ready t))
+     ;; No `checkStatus' here.  The server volunteers the sign-in state
+     ;; through `didChangeStatus'/`didChangeStatus/v2' without being asked --
+     ;; verified against a server that was never sent one -- so asking as well
+     ;; only produced the same warning twice.
      :error-fn
      (lambda (e) (message "ecoin: initialize failed: %s" (plist-get e :message)))
      :timeout-fn

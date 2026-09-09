@@ -24,4 +24,6 @@ Then `M-x ecoin-login` once.
 
 **Other commands**: `ecoin-complete` (manual trigger), `ecoin-status`, `ecoin-logout`, `ecoin-restart`. Server logs go to `*ecoin-log*`, crashes to ` *ecoin-stderr*`.
 
-**Known rough edges**: mid-line suggestions push the rest of the line after the ghost text (same as copilot.el); `ecoin--indent-width` guesses from common mode variables and falls back to `tab-width`; a "not signed in" message appears twice on first start (once from the server's status notification, once from ecoin).
+**Known rough edges**: mid-line suggestions push the rest of the line after the ghost text (same as copilot.el); `ecoin--indent-width` guesses from common mode variables and falls back to `tab-width`.
+
+**The server hangs if `~/.config/github-copilot/github` exists when it starts** — it answers `initialize` and then never replies again. A directory or a plain file does it, empty or not; only the state at startup matters, and the server recreates the directory during normal use, harmlessly. Reproduced with a standalone LSP client on server versions 1.506.1 through 1.544.0, so downgrading does not help. `ecoin--connect` deletes that path before spawning, and leaves it alone if it ever holds real files — set `ecoin-purge-path-before-connect` to nil to opt out.

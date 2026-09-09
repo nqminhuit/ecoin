@@ -146,6 +146,89 @@
       (ecoin-accept-line))
     (should (equal "\nsecond line" (buffer-string)))))
 
+;;;; Status notifications
+;;
+;; Payloads below are copied verbatim from a real copilot-language-server
+;; 1.544.0, signed in and signed out.  It sends BOTH shapes for one condition,
+;; which is why the handler has to suppress the duplicate.
+
+(defmacro ecoin-test--with-status (&rest body)
+  "Run BODY with the status variables reset, returning the messages it emitted."
+  (declare (indent 0))
+  `(let ((ecoin--status nil)
+         (ecoin--status-message nil)
+         (ecoin--status-v2 nil)
+         (captured '()))
+     (cl-letf (((symbol-function 'message)
+                (lambda (fmt &rest args) (push (apply #'format fmt args) captured))))
+       ,@body)
+     (nreverse captured)))
+
+(defconst ecoin-test--v2-normal
+  '(:statuses [(:category "cls" :kind "Normal" :inactive :json-false)
+               (:category "completion" :busy :json-false)]))
+
+(defconst ecoin-test--v2-auth-error
+  '(:statuses [(:category "auth" :kind "Error"
+                :message "You are not signed into GitHub."
+                :askToReSignin :json-false
+                :result (:status "NotSignedIn"))]))
+
+(defconst ecoin-test--flat-error
+  '(:busy :json-false :kind "Error"
+    :message "You are not signed into GitHub."))
+
+(ert-deftest ecoin-test-status-v2-error-is-reported-with-a-login-hint ()
+  (let ((msgs (ecoin-test--with-status
+                (ecoin--handle-notification nil 'didChangeStatus/v2
+                                            ecoin-test--v2-auth-error))))
+    (should (= 1 (length msgs)))
+    (should (string-match-p "not signed into GitHub" (car msgs)))
+    (should (string-match-p "ecoin-login" (car msgs)))))
+
+(ert-deftest ecoin-test-status-is-reported-once-across-both-shapes ()
+  "The server sends v2 and the flat form for one condition; report once."
+  (let ((msgs (ecoin-test--with-status
+                (ecoin--handle-notification nil 'didChangeStatus/v2
+                                            ecoin-test--v2-normal)
+                (ecoin--handle-notification nil 'didChangeStatus
+                                            ecoin-test--flat-error)
+                (ecoin--handle-notification nil 'didChangeStatus/v2
+                                            ecoin-test--v2-auth-error))))
+    (should (= 1 (length msgs)))
+    (should (string-match-p "ecoin-login" (car msgs)))))
+
+(ert-deftest ecoin-test-status-flat-form-still-works-without-v2 ()
+  "A server that never sends v2 must still surface its errors."
+  (let ((msgs (ecoin-test--with-status
+                (ecoin--handle-notification nil 'didChangeStatus
+                                            ecoin-test--flat-error))))
+    (should (= 1 (length msgs)))
+    (should (string-match-p "not signed into GitHub" (car msgs)))))
+
+(ert-deftest ecoin-test-status-normal-is-silent-and-clears-the-error ()
+  (let ((msgs (ecoin-test--with-status
+                (ecoin--handle-notification nil 'didChangeStatus
+                                            ecoin-test--flat-error)
+                (ecoin--handle-notification nil 'didChangeStatus
+                                            '(:kind "Normal" :busy :json-false))
+                ;; the same error again, now that it has cleared, reports again
+                (ecoin--handle-notification nil 'didChangeStatus
+                                            ecoin-test--flat-error))))
+    (should (= 2 (length msgs)))))
+
+(ert-deftest ecoin-test-status-v2-records-the-auth-result ()
+  (ecoin-test--with-status
+    (ecoin--handle-notification nil 'didChangeStatus/v2 ecoin-test--v2-auth-error)
+    (should (equal "NotSignedIn"
+                   (plist-get (plist-get ecoin--status :result) :status)))))
+
+(ert-deftest ecoin-test-status-v2-without-an-auth-entry-is-ignored ()
+  (let ((msgs (ecoin-test--with-status
+                (ecoin--handle-notification nil 'didChangeStatus/v2
+                                            ecoin-test--v2-normal))))
+    (should (null msgs))))
+
 ;;;; ecoin--conn readiness and connect backoff
 
 (ert-deftest ecoin-test-conn-withholds-connection-until-ready ()
