@@ -265,7 +265,12 @@ flips, `ecoin--conn' reports no connection and callers stay quiet."
      :success-fn
      (lambda (_res)
        (jsonrpc-notify conn :initialized (make-hash-table))
-       (setq ecoin--ready t))
+       (setq ecoin--ready t)
+       ;; The connection is made lazily on the first keystroke, so without
+       ;; this there is nothing at all to distinguish "still starting up"
+       ;; from "up, but with nothing to suggest here".  Sign-in trouble
+       ;; arrives separately, through `ecoin--note-status'.
+       (message "ecoin: server ready"))
      ;; No `checkStatus' here.  The server volunteers the sign-in state
      ;; through `didChangeStatus'/`didChangeStatus/v2' without being asked --
      ;; verified against a server that was never sent one -- so asking as well
