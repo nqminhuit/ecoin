@@ -38,6 +38,26 @@
   "Command (program and args) that starts the Copilot language server."
   :type '(repeat string))
 
+(defcustom ecoin-purge-path-before-connect
+  (expand-file-name "github-copilot/github"
+                    (or (getenv "XDG_CONFIG_HOME") "~/.config"))
+  "Path deleted just before the server starts, or nil to leave it alone.
+
+Workaround for an upstream hang.  If this path exists when
+`copilot-language-server' starts, the server answers `initialize' and
+then never replies to anything again: its main thread parks on a futex
+at zero CPU and the process has to be SIGKILLed.  Reproduced without
+Emacs on server versions 1.506.1, 1.518.3, 1.532.6, 1.543.0 and 1.544.0,
+with the path as a directory or as a plain file, empty or not.
+
+Only the state at startup matters -- the server recreates the directory
+during normal use and that does no harm until the next start, which is
+why deleting it here is enough.
+
+Deleted only when it holds no files, so if a later server version really
+does cache something there, its data is left alone."
+  :type '(choice (const :tag "Leave it alone" nil) directory))
+
 (defcustom ecoin-idle-delay 0.15
   "Seconds of idle time after an edit before asking for a suggestion."
   :type 'number)
@@ -90,6 +110,16 @@
 (defconst ecoin-version "0.1.0")
 (defvar ecoin-mode)
 (defvar ecoin--connection nil "The `jsonrpc-connection' to the server, or nil.")
+(defvar ecoin--ready nil "Non-nil once the server has answered `initialize'.")
+(defvar ecoin--last-connect-attempt nil
+  "`float-time' of the last connection attempt, for `ecoin--connect-backoff'.")
+
+(defconst ecoin--connect-backoff 5
+  "Seconds before retrying a server that failed to come up.
+
+Without this a server that dies on startup is respawned by every idle
+tick -- one node process per keystroke -- because `ecoin--conn' no longer
+blocks on the handshake and so no longer throttles itself.")
 (defvar ecoin--request-counter 0 "Increases on every completion request.")
 (defvar ecoin--status nil "Last `didChangeStatus' payload from the server.")
 (defvar ecoin--workspace-folders nil "Folder URIs already announced to the server.")
@@ -142,16 +172,36 @@
 
 (defun ecoin--on-shutdown (_conn)
   (setq ecoin--connection nil
+        ecoin--ready nil
         ecoin--workspace-folders nil)
   (dolist (buf (buffer-list))
     (with-current-buffer buf
       (setq ecoin--opened nil))))
 
+(defun ecoin--purge-stale-cache ()
+  "Delete `ecoin-purge-path-before-connect' if it exists and holds no files."
+  (when-let* ((path ecoin-purge-path-before-connect)
+              ((file-exists-p path)))
+    ;; A symlink is unlinked rather than followed: the goal is only that the
+    ;; path stop existing, and `delete-directory' on a link to a directory
+    ;; would empty the target, which may live outside the config directory.
+    (if (or (file-symlink-p path) (not (file-directory-p path)))
+        (delete-file path)
+      (unless (directory-files-recursively path "")
+        (delete-directory path t)))))
+
 (defun ecoin--connect ()
-  "Start the server and run the LSP handshake.  Return the connection."
+  "Start the server and begin the LSP handshake.  Return the connection.
+
+The handshake is asynchronous deliberately.  It used to be a blocking
+`jsonrpc-request', and `ecoin--conn' is reached from the idle timer that
+fires while you type, so a slow or wedged server froze Emacs for the
+whole 30-second timeout on the first keystroke.  Until `ecoin--ready'
+flips, `ecoin--conn' reports no connection and callers stay quiet."
   (unless (executable-find (car ecoin-server-command))
     (error "ecoin: `%s' not found; install with: npm install -g @github/copilot-language-server"
            (car ecoin-server-command)))
+  (ecoin--purge-stale-cache)
   (let ((conn (make-instance
                'jsonrpc-process-connection
                :name "ecoin"
@@ -165,7 +215,9 @@
                :notification-dispatcher #'ecoin--handle-notification
                :request-dispatcher #'ecoin--handle-request
                :on-shutdown #'ecoin--on-shutdown)))
-    (jsonrpc-request
+    (setq ecoin--connection conn
+          ecoin--ready nil)
+    (jsonrpc-async-request
      conn :initialize
      (list :processId (emacs-pid)
            :clientInfo (list :name "Emacs" :version emacs-version)
@@ -175,26 +227,56 @@
                  :editorPluginInfo (list :name "ecoin" :version ecoin-version))
            :rootUri nil
            :workspaceFolders [])
+     :success-fn
+     (lambda (_res)
+       (jsonrpc-notify conn :initialized (make-hash-table))
+       (setq ecoin--ready t)
+       (jsonrpc-async-request
+        conn :checkStatus (make-hash-table)
+        :success-fn (lambda (res)
+                      (unless (equal (plist-get res :status) "OK")
+                        (message "ecoin: not signed in (%s). Run M-x ecoin-login"
+                                 (plist-get res :status))))
+        :error-fn #'ignore :timeout-fn #'ignore))
+     :error-fn
+     (lambda (e) (message "ecoin: initialize failed: %s" (plist-get e :message)))
+     :timeout-fn
+     (lambda () (message "ecoin: server did not answer initialize within 30s"))
      :timeout 30)
-    (jsonrpc-notify conn :initialized (make-hash-table))
-    (setq ecoin--connection conn)
-    (jsonrpc-async-request
-     conn :checkStatus (make-hash-table)
-     :success-fn (lambda (res)
-                   (unless (equal (plist-get res :status) "OK")
-                     (message "ecoin: not signed in (%s). Run M-x ecoin-login"
-                              (plist-get res :status))))
-     :error-fn #'ignore :timeout-fn #'ignore)
     conn))
 
 (defun ecoin--conn ()
-  "Return a live connection, starting the server if needed."
+  "Return a ready connection, or nil if one is not usable yet.
+Starts the server when it is not running.  Never blocks, so it is safe
+to reach from `post-command-hook' and the idle timer."
   (if (and ecoin--connection (jsonrpc-running-p ecoin--connection))
-      ecoin--connection
-    (ecoin--connect)))
+      (and ecoin--ready ecoin--connection)
+    (when (or (null ecoin--last-connect-attempt)
+              (> (- (float-time) ecoin--last-connect-attempt)
+                 ecoin--connect-backoff))
+      (setq ecoin--last-connect-attempt (float-time))
+      (ecoin--connect))
+    nil))
+
+(defun ecoin--conn-sync ()
+  "Return a ready connection, waiting for the handshake to finish.
+Blocks for up to 30 seconds, so only interactive commands may call this."
+  ;; An explicit command is worth a connection attempt right now, so clear
+  ;; the backoff rather than making the user wait it out.
+  (unless (and ecoin--connection (jsonrpc-running-p ecoin--connection))
+    (setq ecoin--last-connect-attempt nil))
+  (or (ecoin--conn)
+      (let ((deadline (+ (float-time) 30)))
+        (while (and (not ecoin--ready) ecoin--connection (< (float-time) deadline))
+          (accept-process-output nil 0.05))
+        (unless (and ecoin--ready ecoin--connection)
+          (error "ecoin: server did not finish initializing"))
+        ecoin--connection)))
 
 (defun ecoin--notify (method params)
-  (jsonrpc-notify (ecoin--conn) method params))
+  "Send METHOD with PARAMS, or do nothing while the server is not ready."
+  (when-let* ((conn (ecoin--conn)))
+    (jsonrpc-notify conn method params)))
 
 ;;;; Positions, URIs, language ids
 
@@ -303,16 +385,20 @@
 
 (defun ecoin--request (trigger-kind)
   "Ask the server for suggestions at point.
-TRIGGER-KIND is 1 (manual) or 2 (automatic)."
+TRIGGER-KIND is 1 (manual) or 2 (automatic).
+
+Does nothing while the handshake is still in flight -- `ecoin--sync' must
+not run then, since it would mark the buffer opened without a `didOpen'
+ever reaching the server.  The next keystroke retries."
   (condition-case err
-      (progn
+      (when-let* ((conn (ecoin--conn)))
         (ecoin--sync)
         (let* ((buf (current-buffer))
                (pos (point))
                (tick (buffer-chars-modified-tick))
                (id (cl-incf ecoin--request-counter)))
           (jsonrpc-async-request
-           (ecoin--conn) :textDocument/inlineCompletion
+           conn :textDocument/inlineCompletion
            (list :textDocument (list :uri (ecoin--uri) :version ecoin--version)
                  :position (ecoin--lsp-position pos)
                  :context (list :triggerKind trigger-kind)
@@ -429,8 +515,9 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
                           item))
       (delete-region (point) (max (point) end))
       (insert text)
-      (when-let* ((cmd (plist-get item :command)))
-        (jsonrpc-async-request (ecoin--conn) :workspace/executeCommand
+      (when-let* ((cmd (plist-get item :command))
+                  (conn (ecoin--conn)))
+        (jsonrpc-async-request conn :workspace/executeCommand
                                (list :command (plist-get cmd :command)
                                      :arguments (plist-get cmd :arguments))
                                :success-fn #'ignore :error-fn #'ignore :timeout-fn #'ignore)))))
@@ -478,7 +565,9 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
 (defun ecoin-complete ()
   "Request a suggestion at point right now."
   (interactive)
-  (ecoin--request 1))
+  (if (ecoin--conn)
+      (ecoin--request 1)
+    (message "ecoin: still connecting to the server; try again in a moment")))
 
 (defconst ecoin--own-commands
   '(ecoin-accept ecoin-accept-word ecoin-accept-line ecoin-next ecoin-previous ecoin-complete))
@@ -511,7 +600,7 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
 (defun ecoin-login ()
   "Sign in to GitHub Copilot with the device flow."
   (interactive)
-  (let* ((conn (ecoin--conn))
+  (let* ((conn (ecoin--conn-sync))
          (res (jsonrpc-request conn :signInInitiate (make-hash-table) :timeout 30)))
     (if (equal (plist-get res :status) "AlreadySignedIn")
         (message "ecoin: already signed in as %s" (plist-get res :user))
@@ -535,13 +624,13 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
 (defun ecoin-logout ()
   "Sign out of GitHub Copilot."
   (interactive)
-  (jsonrpc-request (ecoin--conn) :signOut (make-hash-table) :timeout 30)
+  (jsonrpc-request (ecoin--conn-sync) :signOut (make-hash-table) :timeout 30)
   (message "ecoin: signed out"))
 
 (defun ecoin-status ()
   "Show the sign-in status and last server status message."
   (interactive)
-  (let ((res (jsonrpc-request (ecoin--conn) :checkStatus (make-hash-table) :timeout 30)))
+  (let ((res (jsonrpc-request (ecoin--conn-sync) :checkStatus (make-hash-table) :timeout 30)))
     (message "ecoin: %s%s%s"
              (plist-get res :status)
              (if-let* ((u (plist-get res :user))) (format " (%s)" u) "")
@@ -554,6 +643,10 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
   (interactive)
   (when ecoin--connection (jsonrpc-shutdown ecoin--connection))
   (ecoin--on-shutdown nil)
+  ;; Cleared here and not in `ecoin--on-shutdown', which also runs when the
+  ;; server dies by itself -- resetting the backoff there would bring back the
+  ;; respawn-per-keystroke loop it exists to prevent.
+  (setq ecoin--last-connect-attempt nil)
   (message "ecoin: server stopped"))
 
 ;;;; Minor mode

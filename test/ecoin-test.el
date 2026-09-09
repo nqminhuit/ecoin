@@ -146,5 +146,108 @@
       (ecoin-accept-line))
     (should (equal "\nsecond line" (buffer-string)))))
 
+;;;; ecoin--conn readiness and connect backoff
+
+(ert-deftest ecoin-test-conn-withholds-connection-until-ready ()
+  "`ecoin--conn' reports nothing until `initialize' has been answered.
+Callers on the typing path must stay quiet rather than send `didOpen'
+into a server that has not finished its handshake."
+  (let ((ecoin--connection 'fake)
+        (ecoin--ready nil)
+        (ecoin--last-connect-attempt nil))
+    (cl-letf (((symbol-function 'jsonrpc-running-p) (lambda (_) t))
+              ((symbol-function 'ecoin--connect)
+               (lambda () (error "must not reconnect while the process is live"))))
+      (should-not (ecoin--conn))
+      (setq ecoin--ready t)
+      (should (eq 'fake (ecoin--conn))))))
+
+(ert-deftest ecoin-test-conn-backs-off-after-a-failed-connect ()
+  "A server that never comes up is not respawned on every idle tick.
+Without the backoff this spawned one node process per keystroke, since
+`ecoin--conn' no longer blocks on the handshake."
+  (let ((ecoin--connection nil)
+        (ecoin--ready nil)
+        (ecoin--last-connect-attempt nil)
+        (calls 0))
+    (cl-letf (((symbol-function 'ecoin--connect)
+               (lambda () (setq calls (1+ calls)) nil)))
+      (dotimes (_ 5) (ecoin--conn))
+      (should (= 1 calls))
+      ;; ...but it does try again once the backoff has elapsed.
+      (setq ecoin--last-connect-attempt
+            (- (float-time) (1+ ecoin--connect-backoff)))
+      (ecoin--conn)
+      (should (= 2 calls)))))
+
+;;;; ecoin--purge-stale-cache
+
+;; The guard matters more than the deletion: this runs against a path in the
+;; user's config directory, so it must never remove anything real.
+
+(defmacro ecoin-test--with-fake-cache (&rest body)
+  "Run BODY with `ecoin-purge-path-before-connect' inside a temp directory."
+  (declare (indent 0))
+  `(let* ((tmp (make-temp-file "ecoin-purge" t))
+          (ecoin-purge-path-before-connect (expand-file-name "github" tmp)))
+     (unwind-protect (progn ,@body)
+       (delete-directory tmp t))))
+
+(ert-deftest ecoin-test-purge-removes-empty-directory ()
+  (ecoin-test--with-fake-cache
+    (make-directory ecoin-purge-path-before-connect t)
+    (ecoin--purge-stale-cache)
+    (should-not (file-exists-p ecoin-purge-path-before-connect))))
+
+(ert-deftest ecoin-test-purge-removes-nested-but-fileless-directories ()
+  ;; What the server actually leaves behind: owner/repo/agents, all empty.
+  (ecoin-test--with-fake-cache
+    (make-directory (expand-file-name "owner/repo/agents"
+                                      ecoin-purge-path-before-connect)
+                    t)
+    (ecoin--purge-stale-cache)
+    (should-not (file-exists-p ecoin-purge-path-before-connect))))
+
+(ert-deftest ecoin-test-purge-removes-a-plain-file ()
+  ;; A file at that path wedges the server just as a directory does.
+  (ecoin-test--with-fake-cache
+    (with-temp-file ecoin-purge-path-before-connect (insert ""))
+    (ecoin--purge-stale-cache)
+    (should-not (file-exists-p ecoin-purge-path-before-connect))))
+
+(ert-deftest ecoin-test-purge-keeps-a-directory-holding-real-data ()
+  (ecoin-test--with-fake-cache
+    (let ((deep (expand-file-name "owner/repo" ecoin-purge-path-before-connect)))
+      (make-directory deep t)
+      (with-temp-file (expand-file-name "index.json" deep) (insert "{}"))
+      (ecoin--purge-stale-cache)
+      (should (file-exists-p ecoin-purge-path-before-connect))
+      (should (file-exists-p (expand-file-name "index.json" deep))))))
+
+(ert-deftest ecoin-test-purge-unlinks-a-symlink-without-touching-its-target ()
+  (ecoin-test--with-fake-cache
+    (let ((target (expand-file-name
+                   "real-data"
+                   (file-name-directory ecoin-purge-path-before-connect))))
+      (make-directory target t)
+      (with-temp-file (expand-file-name "keep.json" target) (insert "{}"))
+      (make-symbolic-link target ecoin-purge-path-before-connect)
+      (ecoin--purge-stale-cache)
+      (should-not (file-exists-p ecoin-purge-path-before-connect))
+      (should (file-exists-p (expand-file-name "keep.json" target))))))
+
+(ert-deftest ecoin-test-purge-is-a-noop-when-the-path-is-absent ()
+  (ecoin-test--with-fake-cache
+    (ecoin--purge-stale-cache)
+    (should-not (file-exists-p ecoin-purge-path-before-connect))))
+
+(ert-deftest ecoin-test-purge-respects-the-nil-opt-out ()
+  (ecoin-test--with-fake-cache
+    (make-directory ecoin-purge-path-before-connect t)
+    (let ((kept ecoin-purge-path-before-connect)
+          (ecoin-purge-path-before-connect nil))
+      (ecoin--purge-stale-cache)
+      (should (file-exists-p kept)))))
+
 (provide 'ecoin-test)
 ;;; ecoin-test.el ends here
