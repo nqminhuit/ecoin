@@ -3,7 +3,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, completion
-;; URL: https://example.invalid/ecoin
+;; URL: https://github.com/nqminhuit/ecoin
 
 ;;; Commentary:
 
