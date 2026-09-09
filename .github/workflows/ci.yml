@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Emacs ${{ matrix.emacs-version }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs-version: ['28.1', '29.1', '30.1', '31.1']
+        experimental: [false]
+        include:
+          # A break here is upstream's, not ours, so it must not gate a merge.
+          - emacs-version: snapshot
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+
+      - name: Report environment
+        run: emacs --version
+
+      - name: Byte-compile, warnings fatal
+        run: |
+          emacs -Q --batch -L . \
+                --eval '(setq byte-compile-error-on-warn t)' \
+                -f batch-byte-compile ecoin.el
+
+      - name: Test the byte-compiled package
+        # This is what users actually load, and `-L .` prefers the .elc.
+        run: |
+          test -f ecoin.elc
+          emacs -Q --batch -L . -L test \
+                -l test/ecoin-test.el \
+                -f ert-run-tests-batch-and-exit
+
+      - name: Test the uncompiled source
+        # Macro expansion differs between the compiled and interpreted
+        # forms, so a missing top-level `require' can pass one and fail
+        # the other.
+        run: |
+          rm -f ecoin.elc
+          emacs -Q --batch -L . -L test \
+                -l test/ecoin-test.el \
+                -f ert-run-tests-batch-and-exit
+
+      - name: checkdoc
+        # Informational: no test suite or MELPA submission yet, so
+        # documentation style does not gate a merge.
+        continue-on-error: true
+        run: |
+          emacs -Q --batch --eval "(require 'checkdoc)" --eval '(checkdoc-file "ecoin.el")'
