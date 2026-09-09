@@ -383,7 +383,7 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
 
 (defun ecoin--clear-overlay ()
   (when ecoin--overlay
-    (when-let ((m (overlay-get ecoin--overlay 'ecoin-end))) (set-marker m nil))
+    (when-let* ((m (overlay-get ecoin--overlay 'ecoin-end))) (set-marker m nil))
     (delete-overlay ecoin--overlay))
   (setq ecoin--overlay nil
         ecoin--overlay-active nil))
@@ -429,7 +429,7 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
                           item))
       (delete-region (point) (max (point) end))
       (insert text)
-      (when-let ((cmd (plist-get item :command)))
+      (when-let* ((cmd (plist-get item :command)))
         (jsonrpc-async-request (ecoin--conn) :workspace/executeCommand
                                (list :command (plist-get cmd :command)
                                      :arguments (plist-get cmd :arguments))
@@ -523,7 +523,7 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
         (jsonrpc-async-request
          conn
          (if (plist-get res :command) :workspace/executeCommand :signInConfirm)
-         (if-let ((cmd (plist-get res :command)))
+         (if-let* ((cmd (plist-get res :command)))
              (list :command (plist-get cmd :command) :arguments (plist-get cmd :arguments))
            (list :userCode code))
          :success-fn (lambda (r) (message "ecoin: signed in as %s (%s)"
@@ -544,8 +544,8 @@ END is where the text to be replaced ends, ITEM is the raw completion item."
   (let ((res (jsonrpc-request (ecoin--conn) :checkStatus (make-hash-table) :timeout 30)))
     (message "ecoin: %s%s%s"
              (plist-get res :status)
-             (if-let ((u (plist-get res :user))) (format " (%s)" u) "")
-             (if-let ((m (plist-get ecoin--status :message)))
+             (if-let* ((u (plist-get res :user))) (format " (%s)" u) "")
+             (if-let* ((m (plist-get ecoin--status :message)))
                  (if (string-empty-p m) "" (format " — %s" m))
                ""))))
 
