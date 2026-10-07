@@ -1108,5 +1108,52 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
   (should-not (ecoin-llama--contents nil))
   (should-not (ecoin-llama--contents '(:content nil))))
 
+;;;; Availability (for the fallback)
+
+(defmacro ecoin-llama-test--no-traffic (&rest body)
+  "Run BODY with the state reset, failing the test if anything is sent."
+  `(let ((ecoin-llama-url "http://127.0.0.1:1") (ecoin-llama-api-key nil))
+     (ecoin-llama--reset)
+     (unwind-protect
+         (cl-letf (((symbol-function 'ecoin-llama--http)
+                    (lambda (&rest _) (ert-fail "available-p sent a request")))
+                   ((symbol-function 'make-network-process)
+                    (lambda (&rest _) (ert-fail "available-p opened a socket"))))
+           ,@body)
+       (ecoin-llama--reset))))
+
+(ert-deftest ecoin-llama-test-available-p-fresh-and-ready-are-available ()
+  (ecoin-llama-test--no-traffic
+   (should (ecoin-backend-available-p 'llama))
+   (ecoin-llama-test--prime-ready)
+   (should (ecoin-backend-available-p 'llama))
+   (should-not (featurep 'ecoin-copilot))))
+
+(ert-deftest ecoin-llama-test-available-p-sleeping-is-available ()
+  (ecoin-llama-test--no-traffic
+   (setq ecoin-llama--state 'sleeping)
+   (should (ecoin-backend-available-p 'llama))))
+
+(ert-deftest ecoin-llama-test-available-p-failure-states-wait-for-the-backoff ()
+  (ecoin-llama-test--no-traffic
+   (dolist (state ecoin-llama--failure-states)
+     (setq ecoin-llama--state state
+           ecoin-llama--backoff-until (+ (float-time) 30))
+     (should-not (ecoin-backend-available-p 'llama))
+     (should (ecoin-backend-unavailable-reason 'llama))
+     (setq ecoin-llama--backoff-until (- (float-time) 1))
+     (should (ecoin-backend-available-p 'llama)))))
+
+(ert-deftest ecoin-llama-test-available-p-config-error-clears-once-fixed ()
+  (ecoin-llama-test--no-traffic
+   (let ((ecoin-llama-url "ftp://nowhere"))
+     (ecoin-llama--config-error "ecoin: bad url")
+     (should-not (ecoin-backend-available-p 'llama))
+     (should (equal "configuration error"
+                    (ecoin-backend-unavailable-reason 'llama))))
+   (let ((ecoin-llama-url "http://127.0.0.1:1"))
+     (should (ecoin-backend-available-p 'llama))
+     (should-not ecoin-llama--config-failed))))
+
 (provide 'ecoin-llama-test)
 ;;; ecoin-llama-test.el ends here

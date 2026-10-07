@@ -620,5 +620,138 @@
         (should (eq (cdr case) (and (string-match-p "secret buffer text" (buffer-string)) t)))
         (should (string-match-p "args-out-of-range\\|Args out of range" (buffer-string)))))))
 
+;;;; Fallback
+
+(defvar ecoin-test--primary-up t "Whether the primary stub reports itself available.")
+(defvar ecoin-test--requests nil "Backends that were sent a request, newest first.")
+(defvar ecoin-test--closed nil "Backends told a buffer closed, newest first.")
+(defvar ecoin-test--messages nil "Messages shown, newest first.")
+
+(cl-defmethod ecoin-backend-request ((backend (eql 'ecoin-test-primary)) _r callback)
+  (push backend ecoin-test--requests)
+  (funcall callback (list (ecoin-make-item :text "from-primary")))
+  nil)
+
+(cl-defmethod ecoin-backend-request ((backend (eql 'ecoin-test-fallback)) _r callback)
+  (push backend ecoin-test--requests)
+  (funcall callback (list (ecoin-make-item :text "from-fallback")))
+  nil)
+
+(cl-defmethod ecoin-backend-available-p ((_b (eql 'ecoin-test-primary)))
+  ecoin-test--primary-up)
+
+(cl-defmethod ecoin-backend-unavailable-reason ((_b (eql 'ecoin-test-primary)))
+  "down")
+
+(cl-defmethod ecoin-backend-shown ((backend (eql 'ecoin-test-fallback)) _item)
+  (push (cons 'shown backend) ecoin-test--closed))
+
+(cl-defmethod ecoin-backend-accepted ((backend (eql 'ecoin-test-fallback)) _i _t _p)
+  (push (cons 'accepted backend) ecoin-test--closed))
+
+(cl-defmethod ecoin-backend-accepted ((backend (eql 'ecoin-test-primary)) _i _t _p)
+  (push (cons 'accepted backend) ecoin-test--closed))
+
+(cl-defmethod ecoin-backend-disable-buffer ((backend (eql 'ecoin-test-primary)))
+  (push (cons 'closed backend) ecoin-test--closed))
+
+(cl-defmethod ecoin-backend-disable-buffer ((backend (eql 'ecoin-test-fallback)))
+  (push (cons 'closed backend) ecoin-test--closed))
+
+(defmacro ecoin-test--with-fallback (content &rest body)
+  "Run BODY in a buffer of CONTENT, primary and fallback stubs configured."
+  (declare (indent 1))
+  `(let ((ecoin-backend 'ecoin-test-primary)
+         (ecoin-fallback-backend 'ecoin-test-fallback)
+         (ecoin-test--primary-up t) (ecoin-test--requests nil)
+         (ecoin-test--closed nil) (ecoin-test--messages nil)
+         (ecoin--fallback-state nil))
+     (cl-letf (((symbol-function 'message)
+                (lambda (fmt &rest args)
+                  (when fmt (push (apply #'format fmt args) ecoin-test--messages)))))
+       (with-temp-buffer
+         (insert ,content)
+         (ecoin-mode 1)
+         (unwind-protect (progn ,@body)
+           (ecoin-mode -1))))))
+
+(ert-deftest ecoin-test-fallback-switches-with_one_message_each_way ()
+  (ecoin-test--with-fallback "foo"
+    (ecoin--request 'manual)
+    (should (equal "from-primary" (ecoin-test--ghost)))
+    (should-not ecoin-test--messages)
+    (setq ecoin-test--primary-up nil)
+    (ecoin--request 'manual)
+    (ecoin--request 'manual)
+    (should (equal "from-fallback" (ecoin-test--ghost)))
+    (should (equal '("ecoin: ecoin-test-primary unavailable (down); using ecoin-test-fallback")
+                   ecoin-test--messages))
+    (should (equal " ecoin[ecoin-test-fallback]" (ecoin--lighter)))
+    (setq ecoin-test--primary-up t)
+    (ecoin--request 'manual)
+    (ecoin--request 'manual)
+    (should (equal "from-primary" (ecoin-test--ghost)))
+    (should (equal "ecoin: ecoin-test-primary is back" (car ecoin-test--messages)))
+    (should (= 2 (length ecoin-test--messages)))
+    (should (equal " ecoin" (ecoin--lighter)))))
+
+(ert-deftest ecoin-test-fallback-nil-or-equal-to-primary-never-falls-back ()
+  (dolist (fallback '(nil ecoin-test-primary))
+    (ecoin-test--with-fallback "foo"
+      (let ((ecoin-fallback-backend fallback))
+        (setq ecoin-test--primary-up nil)
+        (ecoin--request 'manual)
+        (should (equal "from-primary" (ecoin-test--ghost)))
+        (should (equal '(ecoin-test-primary) ecoin-test--requests))
+        (should-not ecoin-test--messages)))))
+
+(ert-deftest ecoin-test-fallback-lighter-marks-copilot ()
+  (let ((ecoin-backend 'ecoin-test-primary) (ecoin-fallback-backend 'copilot)
+        (ecoin--fallback-state '(ecoin-test-primary . copilot)))
+    (should (equal " ecoin[cp]" (ecoin--lighter)))))
+
+(ert-deftest ecoin-test-fallback-skips-excluded-buffers ()
+  (ecoin-test--with-fallback "foo"
+    (setq ecoin-test--primary-up nil)
+    (let ((ecoin-exclude-functions (list (lambda () t))))
+      (ecoin--request 'manual)
+      (ecoin-complete)
+      (should-not ecoin-test--requests)
+      (should-not (seq-filter (lambda (m) (string-match-p "unavailable" m))
+                              ecoin-test--messages))
+      (should-not (ecoin-test--ghost)))))
+
+(ert-deftest ecoin-test-fallback-hooks-reach-the-items-own-backend ()
+  (ecoin-test--with-fallback "foo"
+    (setq ecoin-test--primary-up nil)
+    (ecoin--request 'manual)
+    (setq ecoin-test--primary-up t)
+    (ecoin-accept)
+    (should (equal '((accepted . ecoin-test-fallback) (shown . ecoin-test-fallback))
+                   (seq-filter (lambda (e) (memq (car e) '(shown accepted)))
+                               ecoin-test--closed)))))
+
+(ert-deftest ecoin-test-disable-buffer-reaches-every-serving-backend ()
+  (ecoin-test--with-fallback "foo"
+    (ecoin--request 'manual)
+    (setq ecoin-test--primary-up nil)
+    (ecoin--request 'manual)
+    (setq ecoin-test--primary-up t)
+    (ecoin-mode -1)
+    (let ((closed (mapcar #'cdr (seq-filter (lambda (e) (eq (car e) 'closed))
+                                            ecoin-test--closed))))
+      (should (= 2 (length closed)))
+      (should (memq 'ecoin-test-primary closed))
+      (should (memq 'ecoin-test-fallback closed)))))
+
+(ert-deftest ecoin-test-status-reports-fallback-without-starting-it ()
+  (let ((ecoin-backend 'ecoin-test-stub) (ecoin-fallback-backend 'copilot)
+        (ecoin--fallback-state nil) msg)
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+      (ecoin-status))
+    (should (equal "ecoin: stub is fine; fallback copilot: not started" msg))
+    (should-not (featurep 'ecoin-copilot))))
+
 (provide 'ecoin-test)
 ;;; ecoin-test.el ends here

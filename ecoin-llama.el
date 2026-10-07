@@ -989,6 +989,26 @@ flight finishes the request anyway."
     ('sleeping "[z]")
     ((or 'unsupported 'unauthorized 'down 'error) "[!]")))
 
+(cl-defmethod ecoin-backend-available-p ((_backend (eql 'llama)))
+  "Nil while a failure is fresh; a sleeping server counts, a request wakes it.
+Sends nothing.  A config error is rechecked here, since fixing it needs no
+network."
+  (cond
+   (ecoin-llama--config-failed
+    (condition-case nil (progn (ecoin-llama--target) t) (user-error nil)))
+   ((memq ecoin-llama--state ecoin-llama--failure-states)
+    (not (ecoin-llama--in-backoff-p)))
+   (t t)))
+
+(cl-defmethod ecoin-backend-unavailable-reason ((_backend (eql 'llama)))
+  "Short phrase for the current failure state."
+  (pcase ecoin-llama--state
+    ('down "unreachable")
+    ('loading "loading a model")
+    ('unsupported "model has no FIM tokens")
+    ('unauthorized "API key rejected")
+    ('error (if ecoin-llama--config-failed "configuration error" "error"))))
+
 (cl-defmethod ecoin-backend-restart ((_backend (eql 'llama)))
   "Forget the server state and backoff; the next request probes again."
   (ecoin-llama--reset t)

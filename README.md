@@ -19,6 +19,14 @@ Run a llama-server with a FIM-capable model, for example `llama-server --fim-qwe
 
 Only requests to `ecoin-llama-url` are made, and nothing is sent for files matching `ecoin-exclude-file-regexps`. If the server is down, asleep, loading, rejects the key or has no FIM tokens, ecoin shows one message, a mode-line marker (`ecoin[z]` sleeping, `ecoin[!]` failing) and backs off instead of failing on every keystroke; `M-x ecoin-status` shows the state and `M-x ecoin-restart` resets it. `ecoin-complete` asks for several alternatives (M-n / M-p), up to the server's slot count.
 
+## Fallback to another backend
+
+```elisp
+(setq ecoin-fallback-backend 'copilot)
+```
+
+While the primary backend is unavailable (for llama: unreachable, loading a model, no FIM tokens, key rejected or a configuration error, during its backoff), requests go to the fallback and ecoin says so once; when the primary answers again it says that once too, and the mode-line shows `ecoin[cp]` in between. A sleeping llama server is not unavailable: the request wakes it. **Setting this option is your consent to send code to that backend (GitHub, for Copilot) whenever the primary is unavailable**; there is no prompt. Excluded files are never sent. The default, nil, never falls back.
+
 ## Copilot backend
 
 ```

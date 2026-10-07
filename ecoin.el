@@ -50,6 +50,17 @@ A symbol on which the `ecoin-backend-*' generic functions dispatch."
   :type '(choice (const :tag "llama.cpp server (/infill)" llama)
                  (const :tag "GitHub Copilot" copilot)))
 
+(defcustom ecoin-fallback-backend nil
+  "Backend that serves requests while `ecoin-backend' is unavailable, or nil.
+Setting this is your consent to send code to that backend, for example
+GitHub for `copilot', whenever the primary backend reports itself
+unavailable.  There is no per-request prompt.  Buffers excluded by
+`ecoin-exclude-file-regexps' and `ecoin-exclude-functions' are never sent.
+A value equal to `ecoin-backend' is ignored."
+  :type '(choice (const :tag "No fallback" nil)
+                 (const :tag "GitHub Copilot" copilot)
+                 (const :tag "llama.cpp server (/infill)" llama)))
+
 (defcustom ecoin-idle-delay 0.15
   "Seconds of idle time after an edit before asking for a suggestion."
   :type 'number)
@@ -177,6 +188,10 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
   "Return non-nil if BACKEND can serve requests right now."
   t)
 
+(cl-defgeneric ecoin-backend-unavailable-reason (_backend)
+  "Return a short phrase saying why BACKEND is unavailable, or nil."
+  nil)
+
 (cl-defgeneric ecoin-backend-restart (_backend)
   "Restart BACKEND's server, if it has one.  The default does nothing."
   nil)
@@ -189,6 +204,16 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
   "Load the file that implements BACKEND, if it is a built-in one."
   (when-let* ((feature (alist-get backend ecoin--backend-features)))
     (require feature)))
+
+(defconst ecoin--backend-labels '((llama . "local llama server") (copilot . "Copilot"))
+  "Names of the built-in backends in messages.")
+
+(defconst ecoin--backend-markers '((copilot . "cp"))
+  "Short names of backends for the mode-line while they serve as fallback.")
+
+(defun ecoin--backend-label (backend)
+  "Name of BACKEND for messages."
+  (or (alist-get backend ecoin--backend-labels) (symbol-name backend)))
 
 ;; Declared here so they work after `(require 'ecoin)' without a package
 ;; manager generating autoloads.
@@ -209,6 +234,10 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
 (defvar-local ecoin--pending nil "(BACKEND . HANDLE) of the request in flight.")
 (defvar-local ecoin--items nil "Vector of `ecoin-item' from the last reply.")
 (defvar-local ecoin--index 0)
+(defvar-local ecoin--served-by nil
+  "Backends that have served this buffer, so each can be told when it closes.")
+(defvar ecoin--fallback-state nil
+  "(PRIMARY . FALLBACK) while requests are routed to the fallback, else nil.")
 
 ;;;; Logging
 
@@ -297,26 +326,66 @@ Telemetry hooks must never break editing."
     (setq ecoin--pending nil)
     (ecoin--hook #'ecoin-backend-cancel (car pending) (cdr pending))))
 
+(defun ecoin--fallback-in-use ()
+  "The fallback backend if requests are routed to it now, else nil."
+  (and ecoin--fallback-state
+       (eq (car ecoin--fallback-state) ecoin-backend)
+       (eq (cdr ecoin--fallback-state) ecoin-fallback-backend)
+       (cdr ecoin--fallback-state)))
+
+(defun ecoin--route (primary)
+  "Return the backend to ask now: PRIMARY, or the fallback while it is unavailable.
+Announces each switch once.  Sends nothing."
+  (ecoin--ensure-backend primary)
+  (let ((fallback ecoin-fallback-backend))
+    (if (and fallback
+             (not (eq fallback primary))
+             (not (ecoin-backend-available-p primary)))
+        (progn
+          (ecoin--ensure-backend fallback)
+          (unless (ecoin--fallback-in-use)
+            (setq ecoin--fallback-state (cons primary fallback))
+            (let ((reason (ecoin-backend-unavailable-reason primary)))
+              (message "ecoin: %s unavailable%s; using %s"
+                       (ecoin--backend-label primary)
+                       (if reason (format " (%s)" reason) "")
+                       (ecoin--backend-label fallback)))
+            (force-mode-line-update t))
+          fallback)
+      primary)))
+
+(defun ecoin--note-primary-served (primary)
+  "PRIMARY just answered: if we were on the fallback, say we are back."
+  (when (and ecoin--fallback-state (eq (car ecoin--fallback-state) primary))
+    (setq ecoin--fallback-state nil)
+    (message "ecoin: %s is back" (ecoin--backend-label primary))
+    (force-mode-line-update t)))
+
 (defun ecoin--request (trigger)
   "Ask the backend for suggestions at point.
 TRIGGER is `auto' or `manual'."
   (condition-case err
-      (let* ((backend ecoin-backend)
-             (req (ecoin--make-request :id (cl-incf ecoin--request-counter)
-                                       :buffer (current-buffer)
-                                       :point (point)
-                                       :tick (buffer-chars-modified-tick)
-                                       :trigger trigger)))
-        (ecoin--ensure-backend backend)
-        (ecoin--cancel-pending)
-        ;; The callback may run before the backend returns its handle, in
-        ;; which case there is nothing left to cancel.
-        (let* ((done nil)
-               (handle (ecoin-backend-request
-                        backend req (lambda (items)
-                                      (setq done t)
-                                      (ecoin--deliver backend req items)))))
-          (setq ecoin--pending (and handle (not done) (cons backend handle)))))
+      (unless (ecoin--excluded-p)
+        (let* ((primary ecoin-backend)
+               (backend (ecoin--route primary))
+               (req (ecoin--make-request :id (cl-incf ecoin--request-counter)
+                                         :buffer (current-buffer)
+                                         :point (point)
+                                         :tick (buffer-chars-modified-tick)
+                                         :trigger trigger)))
+          (ecoin--ensure-backend backend)
+          (ecoin--cancel-pending)
+          (cl-pushnew backend ecoin--served-by)
+          ;; The callback may run before the backend returns its handle, in
+          ;; which case there is nothing left to cancel.
+          (let* ((done nil)
+                 (handle (ecoin-backend-request
+                          backend req (lambda (items)
+                                        (setq done t)
+                                        (when (eq backend primary)
+                                          (ecoin--note-primary-served primary))
+                                        (ecoin--deliver backend req items)))))
+            (setq ecoin--pending (and handle (not done) (cons backend handle))))))
     (error (message "ecoin: %s" (error-message-string err)))))
 
 (defun ecoin--deliver (backend req items)
@@ -546,7 +615,8 @@ Motion computed with the ghost on screen lands in the wrong column."
          (moved (not (eql ecoin--last-point (point))))
          (trigger (cond (changed 'auto)
                         ((and moved
-                              (plist-get (ecoin-backend-capabilities ecoin-backend)
+                              (plist-get (ecoin-backend-capabilities
+                                    (or (ecoin--fallback-in-use) ecoin-backend))
                                          :trigger-on-move))
                          'move))))
     (setq ecoin--last-tick (buffer-chars-modified-tick)
@@ -573,11 +643,24 @@ Motion computed with the ghost on screen lands in the wrong column."
 
 ;;;; Commands that dispatch to the backend
 
+(defun ecoin--fallback-status ()
+  "Describe the fallback backend without starting it, or return nil if none."
+  (let ((fallback ecoin-fallback-backend))
+    (when (and fallback (not (eq fallback ecoin-backend)))
+      (let ((feature (alist-get fallback ecoin--backend-features)))
+        (format "fallback %s: %s" fallback
+                (cond ((eq (ecoin--fallback-in-use) fallback) "in use")
+                      ((and feature (not (featurep feature))) "not started")
+                      (t "standing by")))))))
+
 (defun ecoin-status ()
-  "Show the selected backend's status."
+  "Show the selected backend's status and whether the fallback is in use."
   (interactive)
   (ecoin--ensure-backend ecoin-backend)
-  (message "ecoin: %s" (ecoin-backend-status ecoin-backend)))
+  (message "ecoin: %s" (string-join
+                        (delq nil (list (ecoin-backend-status ecoin-backend)
+                                        (ecoin--fallback-status)))
+                        "; ")))
 
 (defun ecoin-restart ()
   "Restart the selected backend's server; it starts again on the next request."
@@ -590,10 +673,17 @@ Motion computed with the ghost on screen lands in the wrong column."
 (defun ecoin--lighter ()
   "Mode-line text of `ecoin-mode': the name plus the backend's marker."
   (concat " ecoin"
-          (or (ignore-errors (ecoin-backend-mode-line ecoin-backend)) "")))
+          (if-let* ((fallback (ecoin--fallback-in-use)))
+              (format "[%s]" (or (alist-get fallback ecoin--backend-markers)
+                                 fallback))
+            (or (ignore-errors (ecoin-backend-mode-line ecoin-backend)) ""))))
 
 (defun ecoin--disable-buffer ()
-  (ecoin--hook #'ecoin-backend-disable-buffer ecoin-backend))
+  "Tell every backend that served this buffer, and the current one, it is closed."
+  (let ((backends (cl-adjoin ecoin-backend ecoin--served-by)))
+    (setq ecoin--served-by nil)
+    (dolist (backend backends)
+      (ecoin--hook #'ecoin-backend-disable-buffer backend))))
 
 ;;;###autoload
 (define-minor-mode ecoin-mode
@@ -609,6 +699,7 @@ Motion computed with the ghost on screen lands in the wrong column."
         (when (boundp 'evil-insert-state-exit-hook)
           (add-hook 'evil-insert-state-exit-hook #'ecoin--hide nil t))
         (add-hook 'kill-buffer-hook #'ecoin--disable-buffer nil t)
+        (cl-pushnew ecoin-backend ecoin--served-by)
         (ecoin--hook #'ecoin-backend-enable-buffer ecoin-backend))
     (ecoin--cancel-timer)
     (ecoin--cancel-pending)
