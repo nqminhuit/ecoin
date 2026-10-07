@@ -1,5 +1,7 @@
 # Setup
 
+ecoin has a pluggable backend, chosen with `ecoin-backend`. `copilot` (GitHub Copilot, in `ecoin-copilot.el`) is the only backend today and stays the default for now; it is loaded on first use. A full README rewrite will follow once more backends exist.
+
 ```
 npm install -g @github/copilot-language-server
 ```

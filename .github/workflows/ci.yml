@@ -38,29 +38,35 @@ jobs:
         run: |
           emacs -Q --batch -L . \
                 --eval '(setq byte-compile-error-on-warn t)' \
-                -f batch-byte-compile ecoin.el
+                -f batch-byte-compile ecoin.el ecoin-copilot.el
 
       - name: Test the byte-compiled package
         # This is what users actually load, and `-L .` prefers the .elc.
+        # One Emacs per test file, so a feature loaded by one cannot hide a
+        # missing `require' in another.
         run: |
-          test -f ecoin.elc
-          emacs -Q --batch -L . -L test \
-                -l test/ecoin-test.el \
-                -f ert-run-tests-batch-and-exit
+          test -f ecoin.elc -a -f ecoin-copilot.elc
+          for f in test/*-test.el; do
+            emacs -Q --batch -L . -L test -l "$f" \
+                  -f ert-run-tests-batch-and-exit || exit 1
+          done
 
       - name: Test the uncompiled source
         # Macro expansion differs between the compiled and interpreted
         # forms, so a missing top-level `require' can pass one and fail
         # the other.
         run: |
-          rm -f ecoin.elc
-          emacs -Q --batch -L . -L test \
-                -l test/ecoin-test.el \
-                -f ert-run-tests-batch-and-exit
+          rm -f ./*.elc
+          for f in test/*-test.el; do
+            emacs -Q --batch -L . -L test -l "$f" \
+                  -f ert-run-tests-batch-and-exit || exit 1
+          done
 
       - name: checkdoc
-        # Informational: no test suite or MELPA submission yet, so
-        # documentation style does not gate a merge.
+        # Informational: documentation style does not gate a merge.
         continue-on-error: true
         run: |
-          emacs -Q --batch --eval "(require 'checkdoc)" --eval '(checkdoc-file "ecoin.el")'
+          for f in ./*.el; do
+            emacs -Q --batch --eval "(require 'checkdoc)" \
+                  --eval "(checkdoc-file \"$f\")"
+          done
