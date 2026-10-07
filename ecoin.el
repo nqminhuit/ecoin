@@ -285,7 +285,7 @@ TRIGGER is `auto' or `manual'."
     rest))
 
 (defun ecoin--typed-into-ghost ()
-  "If the last self-insert typed the ghost's next char, shrink the ghost.  Return t."
+  "Shrink the ghost if the last self-insert typed its next char.  Return t."
   (when (and (ecoin--visible-p)
              (eq this-command 'self-insert-command)
              (= (point) (1+ (overlay-get ecoin--overlay 'ecoin-start))))

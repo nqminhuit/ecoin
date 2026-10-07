@@ -386,9 +386,9 @@ no longer extend the buffer are dropped."
 
 ;;;; Backend methods
 
+(cl-defmethod ecoin-backend-request ((_backend (eql 'copilot)) request callback)
   "Ask the server for suggestions for REQUEST at point in the current buffer.
 CALLBACK receives the converted items.
-  "Ask the server for suggestions at point in the current buffer.
 
 Does nothing while the handshake is still in flight -- `ecoin-copilot--sync'
 must not run then, since it would mark the buffer opened without a `didOpen'
