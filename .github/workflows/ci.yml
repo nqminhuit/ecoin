@@ -40,6 +40,13 @@ jobs:
                 --eval '(setq byte-compile-error-on-warn t)' \
                 -f batch-byte-compile ecoin.el ecoin-copilot.el ecoin-llama.el
 
+      - name: Byte-compile the tests, warnings fatal
+        run: |
+          emacs -Q --batch -L . -L test \
+                --eval '(setq byte-compile-error-on-warn t)' \
+                -f batch-byte-compile test/*-test.el
+          rm -f test/*.elc
+
       - name: Test the byte-compiled package
         # This is what users actually load, and `-L .` prefers the .elc.
         # One Emacs per test file, so a feature loaded by one cannot hide a

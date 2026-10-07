@@ -1,6 +1,6 @@
 ;;; ecoin.el --- Inline completions (ghost text) with pluggable backends  -*- lexical-binding: t; -*-
 
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, completion
 ;; URL: https://github.com/nqminhuit/ecoin
@@ -30,6 +30,8 @@
 ;;
 ;; While a suggestion is visible: TAB accepts it, C-TAB accepts one word,
 ;; M-n / M-p cycle alternatives, any other key dismisses it.
+;;
+;; `M-x ecoin-stats' shows in-memory statistics (nothing is written to disk).
 
 ;;; Code:
 
@@ -136,7 +138,8 @@ If any returns non-nil the buffer is excluded, like a match of
 (cl-defstruct (ecoin-request (:constructor ecoin--make-request))
   "A request for suggestions at one point in one buffer."
   id buffer point tick
-  trigger)                              ; auto | manual | move
+  trigger                               ; auto | manual | move
+  time)                                 ; `float-time' when it was made
 
 (cl-defstruct (ecoin-item (:constructor ecoin-make-item))
   "One suggestion, already normalized for display."
@@ -196,6 +199,15 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
   "Restart BACKEND's server, if it has one.  The default does nothing."
   nil)
 
+;; Called from `ecoin-stats'; see `ecoin--stats-report'.
+(cl-defgeneric ecoin-backend-stats (_backend)
+  "Return extra statistics of BACKEND as a list of (LABEL . TEXT) strings, or nil."
+  nil)
+
+(cl-defgeneric ecoin-backend-stats-reset (_backend)
+  "Forget the statistics BACKEND keeps for `ecoin-backend-stats'."
+  nil)
+
 (defconst ecoin--backend-features '((llama . ecoin-llama)
                                     (copilot . ecoin-copilot))
   "Feature that provides each built-in backend, loaded on first use.")
@@ -222,7 +234,7 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
 
 ;;;; State
 
-(defconst ecoin-version "0.1.0")
+(defconst ecoin-version "0.2.0")
 (defvar ecoin-mode)
 (defvar ecoin--request-counter 0 "Increases on every completion request.")
 
@@ -236,6 +248,8 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
 (defvar-local ecoin--index 0)
 (defvar-local ecoin--served-by nil
   "Backends that have served this buffer, so each can be told when it closes.")
+(defvar-local ecoin--stat-session nil
+  "(BACKEND . ACCEPTED) while a ghost shown in this buffer is unresolved.")
 (defvar ecoin--fallback-state nil
   "(PRIMARY . FALLBACK) while requests are routed to the fallback, else nil.")
 
@@ -256,6 +270,136 @@ Telemetry hooks must never break editing."
     (error (ecoin--log "%s: %s" fn (if ecoin-log-content
                                        (error-message-string err)
                                      (car err))))))
+
+;;;; Statistics
+;;
+;; In memory only.  Events go into a fixed ring of `ecoin--stats-size' slots,
+;; so recording is O(1) and the memory use is bounded.
+
+(defconst ecoin--stats-size 500 "Number of events kept.")
+
+(cl-defstruct (ecoin--ring (:constructor ecoin--make-ring (size &aux (vec (make-vector size nil)))))
+  "Fixed-size ring of the newest SIZE items."
+  size vec (next 0) (count 0))
+
+(defun ecoin--ring-push (ring item)
+  "Add ITEM to RING in O(1), dropping the oldest when full."
+  (let ((size (ecoin--ring-size ring)))
+    (aset (ecoin--ring-vec ring) (ecoin--ring-next ring) item)
+    (setf (ecoin--ring-next ring) (mod (1+ (ecoin--ring-next ring)) size)
+          (ecoin--ring-count ring) (min size (1+ (ecoin--ring-count ring))))))
+
+(defun ecoin--ring-items (ring)
+  "The items of RING, oldest first."
+  (let* ((size (ecoin--ring-size ring))
+         (count (ecoin--ring-count ring))
+         (start (mod (- (ecoin--ring-next ring) count) size)))
+    (cl-loop for i below count
+             collect (aref (ecoin--ring-vec ring) (mod (+ start i) size)))))
+
+(defun ecoin--ring-clear (ring)
+  "Empty RING."
+  (fillarray (ecoin--ring-vec ring) nil)
+  (setf (ecoin--ring-next ring) 0 (ecoin--ring-count ring) 0))
+
+(defvar ecoin--stats (ecoin--make-ring ecoin--stats-size)
+  "Ring of (KIND BACKEND VALUE) events.
+KIND is `latency' (VALUE seconds), `shown', `dismissed' or `accepted' (VALUE
+is `full', `word', `line' or `typed' for the first accept of a ghost).")
+
+(defun ecoin--stat (kind backend &optional value)
+  "Record an event; never signal, since this runs inside command hooks."
+  (condition-case nil
+      (ecoin--ring-push ecoin--stats (list kind backend value))
+    (error nil)))
+
+(defun ecoin--stat-accepted (kind)
+  "Note an accept of KIND in the open ghost session; only the first one counts."
+  (condition-case nil
+      (when-let* ((session ecoin--stat-session))
+        (unless (cdr session)
+          (setcdr session t)
+          (ecoin--stat 'accepted (car session) kind)))
+    (error nil)))
+
+(defun ecoin--stat-end-session (dismissed)
+  "Close the open ghost session; with DISMISSED, count it unless it was accepted."
+  (when-let* ((session ecoin--stat-session))
+    (setq ecoin--stat-session nil)
+    (when (and dismissed (not (cdr session)))
+      (ecoin--stat 'dismissed (car session)))))
+
+(defun ecoin--percentile (sorted p)
+  "The P-th percentile (0..1) of the non-empty ascending list SORTED, nearest rank."
+  (nth (max 0 (1- (ceiling (* p (length sorted))))) sorted))
+
+(defun ecoin--median (numbers)
+  "Median of the non-nil NUMBERS, or nil if there are none."
+  (when-let* ((sorted (sort (delq nil (copy-sequence numbers)) #'<)))
+    (ecoin--percentile sorted 0.5)))
+
+(defun ecoin--stats-report ()
+  "The statistics as text."
+  (let ((by-backend nil))
+    (dolist (event (ecoin--ring-items ecoin--stats))
+      (push event (alist-get (cadr event) by-backend)))
+    (if (null by-backend)
+        "No ecoin events recorded yet.\n"
+      (with-temp-buffer
+        (insert (format "ecoin statistics, last %d events, in memory only\n"
+                        (ecoin--ring-count ecoin--stats)))
+        (dolist (entry (nreverse by-backend))
+          (insert "\n" (ecoin--stats-backend-report (car entry) (cdr entry))))
+        (buffer-string)))))
+
+(defun ecoin--stats-backend-report (backend events)
+  "Text for BACKEND from its EVENTS (newest first)."
+  (let* ((of (lambda (kind) (seq-filter (lambda (e) (eq (car e) kind)) events)))
+         (latency (sort (mapcar #'caddr (funcall of 'latency)) #'<))
+         (shown (length (funcall of 'shown)))
+         (accepted (funcall of 'accepted))
+         (kinds (mapcar #'caddr accepted))
+         (n (length accepted))
+         (partial (+ (cl-count 'word kinds) (cl-count 'line kinds)))
+         (extra (condition-case nil (ecoin-backend-stats backend) (error nil))))
+    (concat
+     (format "%s\n" backend)
+     (if latency
+         (format "  latency        p50 %d ms, p95 %d ms (%d ghosts, trigger to shown)\n"
+                 (round (* 1000 (ecoin--percentile latency 0.5)))
+                 (round (* 1000 (ecoin--percentile latency 0.95)))
+                 (length latency))
+       "  latency        no data\n")
+     (format "  shown          %d\n" shown)
+     (format "  accepted       %d%s (full %d, partial %d: word %d, line %d)\n"
+             n (if (> shown 0) (format " = %d%%" (round (* 100.0 n) shown)) "")
+             (- n partial) partial (cl-count 'word kinds) (cl-count 'line kinds))
+     (format "  dismissed      %d\n" (length (funcall of 'dismissed)))
+     (mapconcat (lambda (row) (format "  %-14s %s\n" (car row) (cdr row))) extra ""))))
+
+;;;###autoload
+(defun ecoin-stats ()
+  "Show statistics about recent suggestions in a read-only buffer.
+Kept in memory only, for the last 500 events; see `ecoin-stats-reset'."
+  (interactive)
+  (let ((text (ecoin--stats-report)))
+    (with-current-buffer (get-buffer-create "*ecoin-stats*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert text))
+      (special-mode)
+      (goto-char (point-min))
+      (display-buffer (current-buffer)))))
+
+;;;###autoload
+(defun ecoin-stats-reset ()
+  "Forget all recorded statistics, including those of the backends."
+  (interactive)
+  (ecoin--ring-clear ecoin--stats)
+  (dolist (backend (mapcar #'car ecoin--backend-features))
+    (when (featurep (alist-get backend ecoin--backend-features))
+      (ecoin--hook #'ecoin-backend-stats-reset backend)))
+  (message "ecoin: statistics cleared"))
 
 ;;;; Requesting completions
 
@@ -385,7 +529,8 @@ TRIGGER is `auto' or `manual'."
                                          :buffer (current-buffer)
                                          :point (point)
                                          :tick (buffer-chars-modified-tick)
-                                         :trigger trigger)))
+                                         :trigger trigger
+                                         :time (float-time))))
           (ecoin--ensure-backend backend)
           (ecoin--cancel-pending)
           (cl-pushnew backend ecoin--served-by)
@@ -412,12 +557,15 @@ TRIGGER is `auto' or `manual'."
                    (= (point) (ecoin-request-point req))
                    (= (ecoin-request-tick req) (buffer-chars-modified-tick)))
           (setq ecoin--pending nil)
-          (ecoin--handle-items
-           (seq-filter (lambda (item)
-                         (unless (ecoin-item-backend item)
-                           (setf (ecoin-item-backend item) backend))
-                         (> (length (ecoin-item-text item)) 0))
-                       (mapcar #'ecoin--dedent-item items))))))))
+          (let ((shown (seq-filter (lambda (item)
+                                     (unless (ecoin-item-backend item)
+                                       (setf (ecoin-item-backend item) backend))
+                                     (> (length (ecoin-item-text item)) 0))
+                                   (mapcar #'ecoin--dedent-item items))))
+            (ecoin--handle-items shown)
+            (when (and shown (ecoin-request-time req))
+              (ecoin--stat 'latency (ecoin-item-backend (car shown))
+                           (- (float-time) (ecoin-request-time req))))))))))
 
 (defun ecoin--handle-items (items)
   (if (null items)
@@ -430,13 +578,17 @@ TRIGGER is `auto' or `manual'."
   "Display item number `ecoin--index' from `ecoin--items' as ghost text."
   (let ((item (aref ecoin--items ecoin--index)))
     (ecoin--display item)
+    ;; Cycling with M-n keeps one session: it ends with an accept or a dismiss.
+    (unless ecoin--stat-session
+      (setq ecoin--stat-session (cons (ecoin-item-backend item) nil)))
+    (ecoin--stat 'shown (ecoin-item-backend item))
     (ecoin--hook #'ecoin-backend-shown (ecoin-item-backend item) item)))
 
 ;;;; Overlay
 
 (defun ecoin--display (item)
   "Show the text of ITEM as ghost text at point."
-  (ecoin--clear-overlay)
+  (ecoin--delete-overlay)
   (let* ((p (point))
          (eol (eolp))
          (ghost (ecoin-item-text item))
@@ -467,6 +619,13 @@ TRIGGER is `auto' or `manual'."
   (ecoin-item-text (overlay-get ecoin--overlay 'ecoin-item)))
 
 (defun ecoin--clear-overlay ()
+  "Hide the ghost; a ghost that was never accepted counts as dismissed."
+  (when ecoin--overlay
+    (ecoin--stat-end-session t))
+  (ecoin--delete-overlay))
+
+(defun ecoin--delete-overlay ()
+  "Remove the ghost's overlays without touching the statistics."
   (when ecoin--overlay
     (when-let* ((m (overlay-get ecoin--overlay 'ecoin-end))) (set-marker m nil))
     (delete-overlay ecoin--overlay))
@@ -498,7 +657,9 @@ Typing the last char accepts the item."
       (when (eq (char-before) (aref ghost 0))
         (if (> (length ghost) 1)
             (ecoin--display (ecoin--remainder item 1 end))
-          (ecoin--clear-overlay)
+          (ecoin--delete-overlay)
+          (ecoin--stat-accepted 'typed)
+          (ecoin--stat-end-session nil)
           (delete-region (point) (max (point) end))
           (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item ghost nil)
           (ecoin--after-full-accept))
@@ -528,8 +689,9 @@ their suggestion."
         (substring text (min (match-end 0) existing))
       text)))
 
-(defun ecoin--accept (transform)
-  "Insert TRANSFORM applied to the ghost text (nil means all of it)."
+(defun ecoin--accept (transform &optional kind)
+  "Insert TRANSFORM applied to the ghost text (nil means all of it).
+KIND is `full', `word' or `line', for the statistics."
   (unless (ecoin--visible-p) (user-error "No suggestion to accept"))
   (let* ((ov ecoin--overlay)
          (item (overlay-get ov 'ecoin-item))
@@ -537,7 +699,9 @@ their suggestion."
          (end (marker-position (overlay-get ov 'ecoin-end)))
          (text (if transform (funcall transform ghost) ghost))
          (partial (< (length text) (length ghost))))
-    (ecoin--clear-overlay)
+    (ecoin--delete-overlay)
+    (ecoin--stat-accepted (if partial kind 'full))
+    (unless partial (ecoin--stat-end-session nil))
     (if partial
         (progn
           (insert text)
@@ -560,14 +724,16 @@ their suggestion."
    (lambda (ghost)
      (if (string-match "\\`[[:space:]\n]*\\(?:[[:word:]]+\\|[^[:space:][:word:]]\\)" ghost)
          (match-string 0 ghost)
-       ghost))))
+       ghost))
+   'word))
 
 (defun ecoin-accept-line ()
   "Accept the next line of the suggestion."
   (interactive)
   (ecoin--accept
    (lambda (ghost)
-     (if (string-match "\\`\n*[^\n]*" ghost) (match-string 0 ghost) ghost))))
+     (if (string-match "\\`\n*[^\n]*" ghost) (match-string 0 ghost) ghost))
+   'line))
 
 (defun ecoin-dismiss ()
   "Hide the suggestion."

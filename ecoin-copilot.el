@@ -1,6 +1,6 @@
 ;;; ecoin-copilot.el --- GitHub Copilot backend for ecoin  -*- lexical-binding: t; -*-
 
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, completion
 ;; URL: https://github.com/nqminhuit/ecoin
