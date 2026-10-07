@@ -2444,6 +2444,25 @@ The server answers every request; nothing but a prefetch can follow SETUP."
         (ecoin-llama--reset t)
         (should (= 24000 (ecoin-llama--extra-cap)))))))
 
+(ert-deftest ecoin-llama-test-halving-is-announced-after-a-plain-500 ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer
+       (lambda (_) '(:status 500
+                     :body (:error (:message "Context size has been exceeded.")))))
+    (ecoin-llama-test--in-buffer "foo("
+      (let ((ring (ecoin-llama--current-ring t)))
+        (ecoin--request 'manual)
+        (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+        (should (= 0 ecoin-llama--halvings))
+        (ecoin-llama-test--put ring (ecoin-llama-test--chunk "a"))
+        (dotimes (_ 2)
+          (insert "x")
+          (ecoin--request 'manual)
+          (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight)))))
+        (should (= 2 ecoin-llama--halvings))
+        (should (= 1 (length (ecoin-llama-test--messages-matching "no completion"))))
+        (should (= 1 (length (ecoin-llama-test--messages-matching "halving"))))))))
+
 (ert-deftest ecoin-llama-test-a-halved-cap-changes-what-is-sent ()
   (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
     (ecoin-llama-test--in-buffer "foo("

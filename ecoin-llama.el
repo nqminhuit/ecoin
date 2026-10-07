@@ -697,11 +697,12 @@ once, unless the returned connection is cancelled."
        ;; Only extra context can be shrunk; the prefix and suffix are capped.
        (when (and job (> (length (ecoin-llama--job-extra job)) 0))
          (cl-incf ecoin-llama--halvings))
-       (ecoin-llama--note-once
-        'context
-        (if (> ecoin-llama--halvings 0)
-            "ecoin: llama server ran out of context; halving the extra context"
-          "ecoin: llama server ran out of context; no completion")))
+       (if (> ecoin-llama--halvings 0)
+           (ecoin-llama--note-once
+            'context-halved
+            "ecoin: llama server ran out of context; halving the extra context")
+         (ecoin-llama--note-once
+          'context "ecoin: llama server ran out of context; no completion")))
       (_ (ecoin-llama--set-state
           'error (format "ecoin: llama server answered %d%s" status
                          (if (string-empty-p msg) "" (concat ": " msg))))))))
