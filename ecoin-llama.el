@@ -27,6 +27,11 @@
 ;;   request.  After a ghost is shown, a speculative request for the context
 ;;   after accepting it fills the cache; it shares the single flight, so a
 ;;   user request waits for it.  Background requests need a recent trigger.
+;; - A per-project ring of code chunks (other files, saves, copies, far parts
+;;   of the buffer) goes out as `input_extra'.  The server puts it first in the
+;;   prompt, so a warm-up request keeps it in the KV cache.  Cached answers are
+;;   keyed by a hash of the extra text, so a changed ring never serves an
+;;   answer computed with other context.
 
 ;;; Code:
 
@@ -141,6 +146,22 @@ Lower than for a user request because a prefetch holds the single flight."
   "Seconds after the last trigger during which background requests are sent."
   :type 'number)
 
+(defcustom ecoin-llama-ring-chunks 16
+  "Extra-context chunks kept per project; 0 turns the ring off."
+  :type 'integer)
+
+(defcustom ecoin-llama-ring-chunk-lines 32
+  "Lines per extra-context chunk."
+  :type 'integer)
+
+(defcustom ecoin-llama-extra-max-chars 24000
+  "Cap on the text of all `input_extra' chunks of one request, oldest dropped."
+  :type 'integer)
+
+(defcustom ecoin-llama-ring-interval 1.0
+  "Seconds between ring updates (one queued chunk, one warm-up request)."
+  :type 'number)
+
 (defcustom ecoin-llama-warn-non-loopback t
   "Non-nil: warn once per session when the URL host is not loopback."
   :type 'boolean)
@@ -174,11 +195,27 @@ Lower than for a user request because a prefetch holds the single flight."
 (defvar ecoin-llama--last-activity nil
   "`float-time' of the last user trigger; background requests need it recent.")
 (defvar ecoin-llama--prefetch-timer nil "Timer that sends the pending prefetch.")
+(defvar ecoin-llama--rings (make-hash-table :test #'equal)
+  "Project root to its `ecoin-llama--ring'.")
+(defvar ecoin-llama--halvings 0
+  "Times a \"context exceeded\" answer halved the extra-context cap.")
+(defvar ecoin-llama--ring-timer nil "Repeating timer of the ring updates.")
+(defvar ecoin-llama--switch-timer nil "Timer that handles a window change.")
+(defvar ecoin-llama--prev-buffer nil "Buffer that was selected at the last switch.")
+(defvar ecoin-llama--kill-source nil "(BUFFER . TEXT) of the last copy or kill.")
+(defvar ecoin-llama--seen-kill nil "The `kill-ring' head the ring timer saw last.")
+(defvar ecoin-llama--last-ring nil "(RING . BUFFER) of the latest completion request.")
+(defvar ecoin-llama--warmed nil "Id of the extra context the last warm-up carried.")
+(defvar ecoin-llama--last-warmup nil "Plist (:chunks :chars :ms) of the last warm-up.")
 
 (cl-defstruct (ecoin-llama--job (:constructor ecoin-llama--make-job))
   "A request from the core.  A nil CALLBACK means it was cancelled."
   buffer point tick callback ctx manual target conn done waking
   prefetch                              ; fills the cache only
+  warmup                                ; fills the server's KV cache only
+  ring                                  ; the `ecoin-llama--ring' it sends
+  extra                                 ; the `input_extra' vector it sent
+  sent                                  ; `float-time' of the send
   waited)                               ; queued behind another request
 
 (defun ecoin-llama--reset (&optional keep-warned)
@@ -187,6 +224,9 @@ Lower than for a user request because a prefetch holds the single flight."
   (when ecoin-llama--queued (setf (ecoin-llama--job-done ecoin-llama--queued) t))
   (when ecoin-llama--retry-timer (cancel-timer ecoin-llama--retry-timer))
   (when ecoin-llama--prefetch-timer (cancel-timer ecoin-llama--prefetch-timer))
+  (when ecoin-llama--ring-timer (cancel-timer ecoin-llama--ring-timer))
+  (when ecoin-llama--switch-timer (cancel-timer ecoin-llama--switch-timer))
+  (clrhash ecoin-llama--rings)
   (ecoin-llama--cache-clear)
   (setq ecoin-llama--state 'unknown
         ecoin-llama--props nil
@@ -203,6 +243,15 @@ Lower than for a user request because a prefetch holds the single flight."
         ecoin-llama--queued nil
         ecoin-llama--retry-timer nil
         ecoin-llama--prefetch-timer nil
+        ecoin-llama--ring-timer nil
+        ecoin-llama--switch-timer nil
+        ecoin-llama--halvings 0
+        ecoin-llama--prev-buffer nil
+        ecoin-llama--kill-source nil
+        ecoin-llama--seen-kill nil
+        ecoin-llama--last-ring nil
+        ecoin-llama--warmed nil
+        ecoin-llama--last-warmup nil
         ecoin-llama--last-activity nil
         ecoin-llama--last-timings nil)
   (unless keep-warned (setq ecoin-llama--warned-loopback nil))
@@ -533,6 +582,10 @@ once, unless the returned connection is cancelled."
 
 ;;;; Jobs: one completion request, from trigger to callback
 
+(defun ecoin-llama--background-job-p (job)
+  "Non-nil if JOB is a prefetch or warm-up: nobody waits for its answer."
+  (or (ecoin-llama--job-prefetch job) (ecoin-llama--job-warmup job)))
+
 (defun ecoin-llama--abort (job)
   "Close JOB's socket for good."
   (ecoin-llama--http-cancel (ecoin-llama--job-conn job))
@@ -578,7 +631,7 @@ once, unless the returned connection is cancelled."
   "Start JOB now, or queue it behind the request in flight."
   (when-let* ((cur ecoin-llama--inflight))
     ;; A prefetch is never cancelled by a trigger; the trigger waits for it.
-    (when (and (not (ecoin-llama--job-prefetch cur))
+    (when (and (not (ecoin-llama--background-job-p cur))
                (ecoin-llama--far-p cur job))
       (ecoin-llama--abort cur)))
   (when ecoin-llama--queued
@@ -601,9 +654,10 @@ once, unless the returned connection is cancelled."
   (cond
    ((or (ecoin-llama--job-done job)
         (and (null (ecoin-llama--job-callback job))
-             (not (ecoin-llama--job-prefetch job))))
+             (not (ecoin-llama--background-job-p job))))
     (setf (ecoin-llama--job-done job) t))
-   ((and (ecoin-llama--job-prefetch job) (not (ecoin-llama--background-ok-p)))
+   ((and (ecoin-llama--background-job-p job)
+         (not (ecoin-llama--background-ok-p)))
     (setf (ecoin-llama--job-done job) t))
    ;; What it waited for may have answered it (a prefetch usually does).
    ((and (ecoin-llama--job-waited job) (not (ecoin-llama--job-manual job))
@@ -625,8 +679,8 @@ once, unless the returned connection is cancelled."
   (let ((msg (plist-get (plist-get body :error) :message)))
     (if (stringp msg) (truncate-string-to-width msg 200 nil nil "...") "")))
 
-(defun ecoin-llama--http-failure (status body)
-  "Update the state for an unsuccessful STATUS with parsed BODY."
+(defun ecoin-llama--http-failure (status body &optional job)
+  "Update the state for an unsuccessful STATUS with parsed BODY of JOB's request."
   (let ((msg (ecoin-llama--error-message body)))
     (pcase status
       (501 (ecoin-llama--set-state
@@ -640,8 +694,14 @@ once, unless the returned connection is cancelled."
             'loading "ecoin: llama server is loading a model"))
       ((and 500 (guard (string-match-p "Context size has been exceeded" msg)))
        (ecoin-llama--note-success)
+       ;; Only extra context can be shrunk; the prefix and suffix are capped.
+       (when (and job (> (length (ecoin-llama--job-extra job)) 0))
+         (cl-incf ecoin-llama--halvings))
        (ecoin-llama--note-once
-        'context "ecoin: llama server ran out of context; no completion"))
+        'context
+        (if (> ecoin-llama--halvings 0)
+            "ecoin: llama server ran out of context; halving the extra context"
+          "ecoin: llama server ran out of context; no completion")))
       (_ (ecoin-llama--set-state
           'error (format "ecoin: llama server answered %d%s" status
                          (if (string-empty-p msg) "" (concat ": " msg))))))))
@@ -670,8 +730,10 @@ once, unless the returned connection is cancelled."
                  (setq ecoin-llama--props props)
                  (ecoin-llama--set-state
                   (if (plist-get props :is_sleeping) 'sleeping 'ready)))
+               ;; A background request must not wake a server that went to sleep.
                (if (or (ecoin-llama--job-callback job)
-                       (ecoin-llama--job-prefetch job))
+                       (and (ecoin-llama--background-job-p job)
+                            (eq ecoin-llama--state 'ready)))
                    (funcall next job)
                  (ecoin-llama--finish job)))))))))
 
@@ -691,15 +753,29 @@ once, unless the returned connection is cancelled."
 (defconst ecoin-llama--forbidden-fields '(:t_max_prompt_ms :n_cache_reuse :model)
   "Fields that must never be sent, even from `ecoin-llama-sampling'.")
 
+(defun ecoin-llama--warmup-body (job)
+  "The /infill plist of the warm-up JOB: only the extra context, no generation."
+  (append (list :input_prefix "" :input_suffix "" :prompt ""
+                :input_extra (or (ecoin-llama--job-extra job) [])
+                :n_predict 0 :samplers [] :cache_prompt t
+                :t_max_predict_ms 1 :response_fields [""])
+          (when ecoin-llama-slot (list :id_slot ecoin-llama-slot))))
+
 (defun ecoin-llama--request-body (job)
   "Build the /infill request plist for JOB."
+  (if (ecoin-llama--job-warmup job)
+      (ecoin-llama--warmup-body job)
+    (ecoin-llama--completion-body job)))
+
+(defun ecoin-llama--completion-body (job)
+  "Build the /infill request plist of the completion or prefetch JOB."
   (let* ((ctx (ecoin-llama--job-ctx job))
          (n (ecoin-llama--alternatives job))
          (body (append
                 (list :input_prefix (plist-get ctx :prefix)
                       :input_suffix (plist-get ctx :suffix)
                       :prompt (plist-get ctx :middle)
-                      :input_extra []
+                      :input_extra (or (ecoin-llama--job-extra job) [])
                       :n_predict ecoin-llama-n-predict
                       :n_indent (plist-get ctx :n-indent)
                       :t_max_predict_ms
@@ -721,7 +797,15 @@ once, unless the returned connection is cancelled."
 
 (defun ecoin-llama--send (job)
   "Send JOB's completion request."
-  (let ((wake (eq ecoin-llama--state 'sleeping)))
+  (let ((wake (eq ecoin-llama--state 'sleeping))
+        (extra (ecoin-llama--ring-extra (ecoin-llama--job-ring job))))
+    ;; The key of the answer is the extra context that was really sent.
+    (setf (ecoin-llama--job-extra job) (car extra)
+          (ecoin-llama--job-sent job) (float-time)
+          ecoin-llama--warmed (cdr extra))
+    (when (ecoin-llama--job-ctx job)
+      (setf (ecoin-llama--job-ctx job)
+            (ecoin-llama--ctx-with-id (ecoin-llama--job-ctx job) (cdr extra))))
     (when wake
       (setf (ecoin-llama--job-waking job) t)
       (ecoin-llama--set-state 'sleeping "ecoin: waking llama server..."))
@@ -744,16 +828,18 @@ once, unless the returned connection is cancelled."
      (error (ecoin-llama--down) (ecoin-llama--finish job))
      ((= status 200)
       (ecoin-llama--note-success)
-      (ecoin-llama--deliver job (plist-get result :body))
+      (if (ecoin-llama--job-warmup job)
+          (ecoin-llama--note-warmup job)
+        (ecoin-llama--deliver job (plist-get result :body)))
       (ecoin-llama--finish job))
-     (t (ecoin-llama--http-failure status (plist-get result :body))
+     (t (ecoin-llama--http-failure status (plist-get result :body) job)
         (ecoin-llama--finish job)))))
 
 (defun ecoin-llama--after-timeout (job)
   "The server answered /props after JOB's request timed out."
   (if (and (eq ecoin-llama--state 'sleeping)
            (not (ecoin-llama--job-waking job))
-           (not (ecoin-llama--job-prefetch job)))
+           (not (ecoin-llama--background-job-p job)))
       (ecoin-llama--send job)
     (when (eq ecoin-llama--state 'sleeping)
       (ecoin-llama--set-state
@@ -1013,10 +1099,17 @@ line, since the core's dedent step on delivery removes it."
   (clrhash ecoin-llama--cache)
   (setq ecoin-llama--cache-order nil))
 
-(defun ecoin-llama--cache-key (before suffix)
-  "Key of the text BEFORE point (prefix and middle) with SUFFIX after it."
+(defconst ecoin-llama--extra-separator "\x1d"
+  "Between the extra-context id and the rest of a cache key.")
+
+(defun ecoin-llama--cache-key (before suffix &optional extra-id)
+  "Key of the text BEFORE point (prefix and middle) with SUFFIX after it.
+EXTRA-ID identifies the extra context the answer was computed with, since
+the server's prompt starts with it; nil (no extra) gives the plain key."
   (secure-hash 'sha256 (encode-coding-string
-                        (concat before ecoin-llama--cache-separator suffix)
+                        (concat (and extra-id
+                                     (concat extra-id ecoin-llama--extra-separator))
+                                before ecoin-llama--cache-separator suffix)
                         'utf-8 t)))
 
 (defun ecoin-llama--cache-touch (key)
@@ -1041,11 +1134,12 @@ a hit survives the prefix window shifting after a newline."
   (let ((prefix (plist-get ctx :prefix))
         (middle (plist-get ctx :middle))
         (suffix (plist-get ctx :suffix))
+        (id (plist-get ctx :extra-id))
         (n 0))
     (when contents
       (while prefix
         (ecoin-llama--cache-put
-         (ecoin-llama--cache-key (concat prefix middle) suffix) contents)
+         (ecoin-llama--cache-key (concat prefix middle) suffix id) contents)
         (let ((nl (and (< n ecoin-llama--cache-shifted-keys)
                        (string-search "\n" prefix))))
           (setq prefix (and nl (substring prefix (1+ nl)))
@@ -1055,17 +1149,19 @@ a hit survives the prefix window shifting after a newline."
   "Non-nil if the exact context CTX is cached."
   (gethash (ecoin-llama--cache-key (concat (plist-get ctx :prefix)
                                            (plist-get ctx :middle))
-                                   (plist-get ctx :suffix))
+                                   (plist-get ctx :suffix)
+                                   (plist-get ctx :extra-id))
            ecoin-llama--cache))
 
-(defun ecoin-llama--cache-typed-through (before suffix)
+(defun ecoin-llama--cache-typed-through (before suffix &optional extra-id)
   "Items for text BEFORE point (prefix and middle) from an older shorter context.
+SUFFIX follows point; only answers computed with the same EXTRA-ID count.
 Return the post-processed items of the longest cached remainder that is
 still a ghost, or nil.  The chars typed since are removed from the front."
   (let ((n (length before)) (candidates nil))
     (cl-loop for i from 1 to (min ecoin-llama--typed-back-max n)
              for key = (ecoin-llama--cache-key (substring before 0 (- n i))
-                                               suffix)
+                                               suffix extra-id)
              for hit = (gethash key ecoin-llama--cache)
              for typed = (and hit (substring before (- n i)))
              do (dolist (c hit)
@@ -1082,12 +1178,13 @@ still a ghost, or nil.  The chars typed since are removed from the front."
 Exact key first, then typed-through reuse."
   (let* ((before (concat (plist-get ctx :prefix) (plist-get ctx :middle)))
          (suffix (plist-get ctx :suffix))
-         (key (ecoin-llama--cache-key before suffix)))
+         (id (plist-get ctx :extra-id))
+         (key (ecoin-llama--cache-key before suffix id)))
     (if-let* ((hit (gethash key ecoin-llama--cache)))
         (progn (ecoin-llama--cache-touch key)
                (list (ecoin-llama--items hit)))
       (when (> (hash-table-count ecoin-llama--cache) 0)
-        (when-let* ((items (ecoin-llama--cache-typed-through before suffix)))
+        (when-let* ((items (ecoin-llama--cache-typed-through before suffix id)))
           (list items))))))
 
 (defun ecoin-llama--call-with-items (callback items)
@@ -1135,13 +1232,17 @@ it would only hold the single flight."
              (not (ecoin-llama--cache-has-p ctx)))
     (with-current-buffer buffer
       (when (and (ecoin--visible-p)
-                 (equal ctx (ecoin-llama--context (ecoin--overlay-ghost))))
+                 ;; The ring may have changed since; send refreshes the id.
+                 (equal (ecoin-llama--ctx-with-id ctx nil)
+                        (ecoin-llama--ctx-with-id
+                         (ecoin-llama--context (ecoin--overlay-ghost)) nil)))
         (when-let* ((target (condition-case nil (ecoin-llama--target)
                               (user-error nil))))
           (ecoin-llama--start
            (ecoin-llama--make-job :buffer buffer :point (point)
                                   :tick (buffer-chars-modified-tick)
-                                  :ctx ctx :target target :prefetch t)))))))
+                                  :ctx ctx :target target :prefetch t
+                                  :ring (ecoin-llama--current-ring))))))))
 
 (defun ecoin-llama--note-shown (item)
   "A ghost for ITEM is displayed: cache what accepting its first line leaves.
@@ -1154,13 +1255,15 @@ accepting all of it."
       (let ((line (match-string 0 ghost))
             (rest (substring ghost (match-end 0))))
         (when (> (length rest) 0)
-          (ecoin-llama--cache-store (ecoin-llama--context line) (list rest))))
+          (ecoin-llama--cache-store
+           (ecoin-llama--context-for (ecoin-llama--current-ring) line)
+           (list rest))))
       (when (and ecoin-llama-prefetch
                  (ecoin-llama--background-ok-p)
                  (string-match-p ecoin-llama-line-suffix-regexp
                                  (buffer-substring-no-properties
                                   (point) (line-end-position))))
-        (let ((ctx (ecoin-llama--context ghost)))
+        (let ((ctx (ecoin-llama--context-for (ecoin-llama--current-ring) ghost)))
           (unless (ecoin-llama--cache-has-p ctx)
             (when ecoin-llama--prefetch-timer
               (cancel-timer ecoin-llama--prefetch-timer))
@@ -1169,6 +1272,488 @@ accepting all of it."
             (setq ecoin-llama--prefetch-timer
                   (run-with-timer 0 nil #'ecoin-llama--prefetch-fire
                                   (current-buffer) ctx))))))))
+
+;;;; Extra-context ring
+
+;; Every project (its root, or the directory of a buffer outside any project)
+;; has a ring of recently seen code chunks.  They are sent as `input_extra',
+;; which llama-server puts first in the prompt, so a warm-up request keeps
+;; them in its KV cache and a completion only processes the local context.
+;; Chunks come from file buffers with `ecoin-mode' on that are not excluded
+;; (`ecoin--excluded-p'), and only ever go to the ring of their own project.
+
+(declare-function project-current "project")
+(declare-function project-root "project")
+
+(defconst ecoin-llama--queue-max 16 "Chunks waiting to enter a ring.")
+(defconst ecoin-llama--pick-min-lines 3 "Fewest lines of a chunk.")
+(defconst ecoin-llama--far-distance 32
+  "Lines point must move after the last far pick for the next one.")
+(defconst ecoin-llama--far-scope 1024 "How far above point far picks look.")
+(defconst ecoin-llama--far-suffix-span 64 "Lines of the far window below point.")
+(defconst ecoin-llama--evict-on-pick 0.9
+  "Similarity above which a new chunk evicts an old one (far picks: is dropped).")
+(defconst ecoin-llama--evict-at-request 0.5
+  "Similarity to the text around point above which a chunk is evicted.")
+(defconst ecoin-llama--token-regexp "[^[:alnum:]_]+"
+  "Separates tokens; not `\\W', which follows the buffer's syntax table.")
+(defconst ecoin-llama--kill-commands
+  '(kill-ring-save kill-region evil-yank evil-delete)
+  "Commands whose result in `kill-ring' may become a chunk.")
+
+(cl-defstruct (ecoin-llama--ring (:constructor ecoin-llama--make-ring))
+  "Extra context of one project.  CHUNKS and QUEUE are oldest first.
+Each chunk is (:filename REL :text STR :time T).  VERSION counts changes of
+CHUNKS; MEMO caches the serialized extra; FAR marks the last far pick."
+  chunks queue (version 0) memo far)
+
+(defvar-local ecoin-llama--root-cache nil "(DIRECTORY . ROOT) of this buffer.")
+(defvar ecoin-llama--chunk-tokens (make-hash-table :test #'eq :weakness 'key)
+  "Chunk to the set of its tokens.")
+
+;;;;; Similarity
+
+(defun ecoin-llama--token-set (text)
+  "Hash set of the tokens of TEXT."
+  (let ((set (make-hash-table :test #'equal)))
+    (dolist (token (split-string text ecoin-llama--token-regexp t))
+      (puthash token t set))
+    set))
+
+(defun ecoin-llama--dice (set0 set1)
+  "Dice coefficient 2|common| / (|SET0| + |SET1|) of two token sets.
+This is the set variant: llama.vim counts duplicate tokens of one text
+against the other's set, which can exceed 1.  Two empty sets are equal."
+  (let ((n0 (hash-table-count set0))
+        (n1 (hash-table-count set1))
+        (common 0))
+    (if (= 0 n0 n1)
+        1.0
+      (let ((small (if (<= n0 n1) set0 set1))
+            (large (if (<= n0 n1) set1 set0)))
+        (maphash (lambda (token _) (when (gethash token large) (cl-incf common)))
+                 small)
+        (/ (* 2.0 common) (+ n0 n1))))))
+
+(defun ecoin-llama--similarity (text0 text1)
+  "Dice similarity of the tokens of TEXT0 and TEXT1."
+  (ecoin-llama--dice (ecoin-llama--token-set text0)
+                     (ecoin-llama--token-set text1)))
+
+(defun ecoin-llama--chunk-tokens (chunk)
+  "The token set of CHUNK, computed once."
+  (or (gethash chunk ecoin-llama--chunk-tokens)
+      (puthash chunk (ecoin-llama--token-set (plist-get chunk :text))
+               ecoin-llama--chunk-tokens)))
+
+;;;;; Rings
+
+(defun ecoin-llama--project-root ()
+  "Root of the current buffer's project, or nil."
+  (when (require 'project nil t)
+    (condition-case nil
+        (when-let* ((project (project-current)))
+          (file-name-as-directory (expand-file-name (project-root project))))
+      (error nil))))
+
+(defun ecoin-llama--root ()
+  "Key of the current buffer's ring, cached; nil for remote directories."
+  (unless (file-remote-p default-directory)
+    (let ((dir default-directory))
+      (if (equal (car ecoin-llama--root-cache) dir)
+          (cdr ecoin-llama--root-cache)
+        (let ((root (or (ecoin-llama--project-root)
+                        (file-name-as-directory (expand-file-name dir)))))
+          (setq ecoin-llama--root-cache (cons dir root))
+          root)))))
+
+(defun ecoin-llama--current-ring (&optional create)
+  "The ring of the current buffer's project; CREATE it if missing.
+Nil when the ring is off."
+  (when (> ecoin-llama-ring-chunks 0)
+    (when-let* ((root (ecoin-llama--root)))
+      (or (gethash root ecoin-llama--rings)
+          (and create
+               (puthash root (ecoin-llama--make-ring) ecoin-llama--rings))))))
+
+(defun ecoin-llama--source-p ()
+  "Non-nil if the current buffer may contribute chunks."
+  (and (eq ecoin-backend 'llama)
+       (> ecoin-llama-ring-chunks 0)
+       buffer-file-name
+       (bound-and-true-p ecoin-mode)
+       (not (file-remote-p buffer-file-name))
+       (not (ecoin--excluded-p))))
+
+(defun ecoin-llama--relative-name ()
+  "File name of the current buffer relative to its ring root, or nil if outside."
+  (when-let* ((root (ecoin-llama--root)))
+    (let ((rel (file-relative-name buffer-file-name root)))
+      (unless (string-prefix-p "../" rel) rel))))
+
+;;;;; Extra text: serialization and its id
+
+(defun ecoin-llama--extra-cap ()
+  "Effective `ecoin-llama-extra-max-chars' after the halvings of this session."
+  (ash ecoin-llama-extra-max-chars (- ecoin-llama--halvings)))
+
+(defun ecoin-llama--serialize (chunks)
+  "Vector of the objects sent for CHUNKS, oldest first, under the char cap.
+The newest chunks win: older ones are dropped until the text fits."
+  (let ((budget (ecoin-llama--extra-cap))
+        (kept nil))
+    (cl-loop for chunk in (reverse (last chunks (max 0 ecoin-llama-ring-chunks)))
+             do (setq budget (- budget (length (plist-get chunk :text))))
+             while (>= budget 0)
+             do (push (list :filename (plist-get chunk :filename)
+                            :text (plist-get chunk :text))
+                      kept))
+    (vconcat kept)))
+
+(defun ecoin-llama--ring-extra (ring)
+  "Return (VECTOR . ID) for RING: the `input_extra' to send and its identity.
+ID is a hash of the exact serialized extra, nil when it is empty, so two
+rings with the same text share cache entries and an empty ring changes none."
+  (if (null ring)
+      (cons [] nil)
+    (let ((stamp (list (ecoin-llama--ring-version ring)
+                       (ecoin-llama--extra-cap) ecoin-llama-ring-chunks)))
+      (if (equal (car (ecoin-llama--ring-memo ring)) stamp)
+          (cdr (ecoin-llama--ring-memo ring))
+        (let* ((vector (ecoin-llama--serialize (ecoin-llama--ring-chunks ring)))
+               (id (and (> (length vector) 0)
+                        (secure-hash
+                         'sha256
+                         (encode-coding-string
+                          (mapconcat (lambda (o) (concat (plist-get o :filename)
+                                                         "\n" (plist-get o :text)))
+                                     vector "\x1f")
+                          'utf-8 t))))
+               (result (cons vector id)))
+          (setf (ecoin-llama--ring-memo ring) (cons stamp result))
+          result)))))
+
+(defun ecoin-llama--extra-chars (vector)
+  "Characters of text in the extra VECTOR."
+  (cl-loop for o across vector sum (length (plist-get o :text))))
+
+(defun ecoin-llama--ctx-with-id (ctx id)
+  "CTX with its :extra-id set to ID (removed when ID is nil)."
+  (let ((rest (cl-loop for (key value) on ctx by #'cddr
+                       unless (eq key :extra-id) append (list key value))))
+    (if id (append rest (list :extra-id id)) rest)))
+
+(defun ecoin-llama--context-for (ring &optional insertion)
+  "`ecoin-llama--context' at point (see INSERTION there) plus RING's extra id."
+  (ecoin-llama--ctx-with-id (ecoin-llama--context insertion)
+                            (cdr (ecoin-llama--ring-extra ring))))
+
+;;;;; Picks
+
+(defun ecoin-llama--with-newline (text)
+  "TEXT ending in a newline."
+  (if (string-suffix-p "\n" text) text (concat text "\n")))
+
+(defun ecoin-llama--lines-around (pos half)
+  "Text of the lines HALF above to HALF below the line at POS, widened."
+  (save-restriction
+    (widen)
+    (save-excursion
+      (goto-char pos)
+      (forward-line 0)
+      (let* ((bol (point))
+             (start (progn (forward-line (- half)) (point)))
+             (end (progn (goto-char bol) (forward-line (1+ half)) (point))))
+        (ecoin-llama--with-newline (buffer-substring-no-properties start end))))))
+
+(defun ecoin-llama--random-offset (max)
+  "A random integer from 0 to MAX; tests replace it."
+  (random (1+ max)))
+
+(defun ecoin-llama--remove-chunks (ring similar)
+  "Drop the chunks SIMILAR from RING's queue and chunks."
+  (when similar
+    (setf (ecoin-llama--ring-queue ring)
+          (seq-remove (lambda (c) (memq c similar)) (ecoin-llama--ring-queue ring)))
+    (when (seq-some (lambda (c) (memq c similar)) (ecoin-llama--ring-chunks ring))
+      (setf (ecoin-llama--ring-chunks ring)
+            (seq-remove (lambda (c) (memq c similar)) (ecoin-llama--ring-chunks ring)))
+      (cl-incf (ecoin-llama--ring-version ring)))))
+
+(defun ecoin-llama--enqueue (ring chunk evict)
+  "Queue CHUNK in RING; non-nil if it was queued.
+A chunk identical to a known one is dropped.  Known chunks more similar to
+it than `ecoin-llama--evict-on-pick' are evicted when EVICT, else CHUNK is
+dropped."
+  (let* ((known (append (ecoin-llama--ring-queue ring) (ecoin-llama--ring-chunks ring)))
+         (tokens (ecoin-llama--token-set (plist-get chunk :text))))
+    (unless (seq-some (lambda (c) (and (equal (plist-get c :text) (plist-get chunk :text))
+                                       (equal (plist-get c :filename)
+                                              (plist-get chunk :filename))))
+                      known)
+      (let ((similar (seq-filter (lambda (c) (> (ecoin-llama--dice
+                                                 (ecoin-llama--chunk-tokens c) tokens)
+                                                ecoin-llama--evict-on-pick))
+                                 known)))
+        (when (or evict (null similar))
+          (puthash chunk tokens ecoin-llama--chunk-tokens)
+          (ecoin-llama--remove-chunks ring similar)
+          (setf (ecoin-llama--ring-queue ring)
+                (last (append (ecoin-llama--ring-queue ring) (list chunk))
+                      ecoin-llama--queue-max))
+          t)))))
+
+(defun ecoin-llama--pick (ring name text evict)
+  "Queue TEXT, from the file NAME, in RING as a chunk."
+  (when (and (>= (cl-count ?\n text) ecoin-llama--pick-min-lines)
+             (string-match-p "[[:alnum:]_]" text)
+             (ecoin-llama--enqueue
+              ring (list :filename name :text text :time (float-time)) evict))
+    (ecoin--log "ring: picked %d lines; %d queued, %d in the ring"
+                (cl-count ?\n text)
+                (length (ecoin-llama--ring-queue ring))
+                (length (ecoin-llama--ring-chunks ring)))))
+
+(defun ecoin-llama--point-of (buffer)
+  "Point of BUFFER as the user sees it."
+  (if-let* ((window (get-buffer-window buffer)))
+      (window-point window)
+    (with-current-buffer buffer (point))))
+
+(defun ecoin-llama--pick-around-point (buffer &optional modified-ok)
+  "Queue the lines around point of BUFFER, an unmodified source file.
+MODIFIED-OK allows a buffer with unsaved changes."
+  (when (buffer-live-p buffer)
+    (let ((pos (ecoin-llama--point-of buffer)))
+      (with-current-buffer buffer
+        (when (and (or modified-ok (not (buffer-modified-p)))
+                   (ecoin-llama--source-p))
+          (when-let* ((ring (ecoin-llama--current-ring t))
+                      (name (ecoin-llama--relative-name)))
+            (ecoin-llama--pick
+             ring name
+             (ecoin-llama--lines-around pos (/ ecoin-llama-ring-chunk-lines 2))
+             t)))))))
+
+(defun ecoin-llama--yank-text (text)
+  "TEXT cut to at most `ecoin-llama-ring-chunk-lines' lines, from a random start."
+  (let* ((lines (split-string (string-remove-suffix "\n" text) "\n"))
+         (size (max 1 ecoin-llama-ring-chunk-lines))
+         (n (length lines)))
+    (if (<= n size)
+        (ecoin-llama--with-newline text)
+      (let ((from (ecoin-llama--random-offset (- n size))))
+        (concat (mapconcat #'identity (seq-subseq lines from (+ from size)) "\n")
+                "\n")))))
+
+(defun ecoin-llama--window-text (start lines)
+  "A random `ecoin-llama-ring-chunk-lines' window of the LINES lines at START."
+  (let* ((size (max 1 ecoin-llama-ring-chunk-lines))
+         (offset (if (> lines size)
+                     (ecoin-llama--random-offset (- lines size))
+                   0)))
+    (goto-char start)
+    (forward-line offset)
+    (let ((from (point)))
+      (forward-line (min size lines))
+      (ecoin-llama--with-newline (buffer-substring-no-properties from (point))))))
+
+(defun ecoin-llama--far-texts ()
+  "Random windows far above and below point, as a list of texts."
+  (save-restriction
+    (widen)
+    (save-excursion
+      (forward-line 0)
+      (let ((bol (point)) (texts nil))
+        ;; Lines [y - scope, y - n_prefix]: just above what the prompt holds.
+        (when (zerop (forward-line (- ecoin-llama-n-prefix)))
+          (let* ((above (max 0 (- ecoin-llama--far-scope ecoin-llama-n-prefix)))
+                 (short (abs (forward-line (- above))))
+                 (lines (- (1+ above) short)))
+            (when (>= lines ecoin-llama--pick-min-lines)
+              (push (ecoin-llama--window-text (point) lines) texts))))
+        ;; Lines [y + n_suffix, y + n_suffix + 64].
+        (goto-char bol)
+        (when (zerop (forward-line ecoin-llama-n-suffix))
+          (let* ((start (point))
+                 (short (forward-line (1+ ecoin-llama--far-suffix-span)))
+                 (lines (- (1+ ecoin-llama--far-suffix-span) short)))
+            (when (>= lines ecoin-llama--pick-min-lines)
+              (push (ecoin-llama--window-text start lines) texts))))
+        (nreverse texts)))))
+
+(defun ecoin-llama--lines-apart-p (a b)
+  "Non-nil if positions A and B are over `ecoin-llama--far-distance' lines apart."
+  (save-restriction
+    (widen)
+    (save-excursion
+      (goto-char (min a b))
+      (and (zerop (forward-line (1+ ecoin-llama--far-distance)))
+           (<= (point) (max a b))))))
+
+(defun ecoin-llama--maybe-far-pick (ring)
+  "After a request: when point moved far since RING's last far pick, pick again.
+Far chunks are skipped, not evicting, when similar to a known one."
+  (when (and ring (ecoin-llama--source-p))
+    (let ((mark (ecoin-llama--ring-far ring)))
+      (when (or (not (and mark (eq (marker-buffer mark) (current-buffer))))
+                (ecoin-llama--lines-apart-p (marker-position mark) (point)))
+        (if mark
+            (set-marker mark (point))
+          (setf (ecoin-llama--ring-far ring) (point-marker)))
+        (when-let* ((name (ecoin-llama--relative-name)))
+          (dolist (text (ecoin-llama--far-texts))
+            (ecoin-llama--pick ring name text nil)))))))
+
+;;;;; Hooks: buffer switches, saves, copies
+
+(defun ecoin-llama--note-switch (buffer)
+  "BUFFER is now selected: pick around point in the buffer left and in BUFFER."
+  (let ((prev ecoin-llama--prev-buffer))
+    (unless (or (eq buffer prev) (not (buffer-live-p buffer))
+                (with-current-buffer buffer (minibufferp)))
+      (setq ecoin-llama--prev-buffer buffer)
+      (ecoin-llama--pick-around-point prev)
+      (ecoin-llama--pick-around-point buffer))))
+
+(defun ecoin-llama--switch-fire ()
+  "Run the picks of a window change, outside redisplay."
+  (setq ecoin-llama--switch-timer nil)
+  (ecoin--hook #'ecoin-llama--note-switch (window-buffer (selected-window))))
+
+(defun ecoin-llama--on-window-change (&rest _)
+  "Hook: defer the picks, which may look up the project, out of redisplay."
+  (when (and (eq ecoin-backend 'llama) (> ecoin-llama-ring-chunks 0)
+             (not ecoin-llama--switch-timer))
+    (setq ecoin-llama--switch-timer
+          (run-with-timer 0 nil #'ecoin-llama--switch-fire))))
+
+(defun ecoin-llama--on-save ()
+  "Hook: pick around point of the buffer just saved."
+  (when (bound-and-true-p ecoin-mode)
+    (ecoin--hook #'ecoin-llama--pick-around-point (current-buffer) t)))
+
+(defun ecoin-llama--on-command ()
+  "Hook: remember which buffer a copy or kill came from, if it may be used."
+  (when (and (memq this-command ecoin-llama--kill-commands)
+             (stringp (car kill-ring)))
+    (setq ecoin-llama--kill-source
+          (and (ignore-errors (ecoin-llama--source-p))
+               (cons (current-buffer) (car kill-ring))))))
+
+(defun ecoin-llama--poll-kill ()
+  "Pick from `kill-ring' when its head changed and the source is known."
+  (let ((head (car kill-ring)))
+    (when (and (stringp head) (not (eq head ecoin-llama--seen-kill)))
+      (setq ecoin-llama--seen-kill head)
+      (when-let* ((source ecoin-llama--kill-source)
+                  ((eq (cdr source) head))
+                  ((buffer-live-p (car source))))
+        (setq ecoin-llama--kill-source nil)
+        (with-current-buffer (car source)
+          (when (ecoin-llama--source-p)
+            (when-let* ((ring (ecoin-llama--current-ring t))
+                        (name (ecoin-llama--relative-name)))
+              (ecoin-llama--pick ring name (ecoin-llama--yank-text head) t))))))))
+
+(add-hook 'after-save-hook #'ecoin-llama--on-save)
+(add-hook 'post-command-hook #'ecoin-llama--on-command)
+(add-hook 'window-buffer-change-functions #'ecoin-llama--on-window-change)
+(add-hook 'window-selection-change-functions #'ecoin-llama--on-window-change)
+
+(defun ecoin-llama-unload-function ()
+  "Remove the hooks of the ring; called by `unload-feature'."
+  (remove-hook 'after-save-hook #'ecoin-llama--on-save)
+  (remove-hook 'post-command-hook #'ecoin-llama--on-command)
+  (remove-hook 'window-buffer-change-functions #'ecoin-llama--on-window-change)
+  (remove-hook 'window-selection-change-functions #'ecoin-llama--on-window-change)
+  nil)
+
+;;;;; Eviction at request time
+
+(defun ecoin-llama--evict-local (ring buffer &optional with-queue)
+  "Evict RING's chunks too similar to the text around point in BUFFER.
+Chunks like that make the model repeat what is already there.  WITH-QUEUE
+also evicts from the queue."
+  (when (and ring (buffer-live-p buffer)
+             (or (ecoin-llama--ring-chunks ring)
+                 (and with-queue (ecoin-llama--ring-queue ring))))
+    (let ((window (with-current-buffer buffer
+                    (ecoin-llama--token-set
+                     (ecoin-llama--lines-around
+                      (point) (/ ecoin-llama-ring-chunk-lines 2))))))
+      (ecoin-llama--remove-chunks
+       ring
+       (seq-filter (lambda (c) (> (ecoin-llama--dice (ecoin-llama--chunk-tokens c)
+                                                     window)
+                                  ecoin-llama--evict-at-request))
+                   (append (and with-queue (ecoin-llama--ring-queue ring))
+                           (ecoin-llama--ring-chunks ring)))))))
+
+;;;;; Ring timer and warm-up
+
+(defun ecoin-llama--ring-alive-p ()
+  "Non-nil while the ring timer has work: a recent trigger, an ecoin buffer."
+  (and (> ecoin-llama-ring-chunks 0)
+       ecoin-llama--last-activity
+       (< (- (float-time) ecoin-llama--last-activity) ecoin-llama-activity-window)
+       (seq-some (lambda (b) (buffer-local-value 'ecoin-mode b)) (buffer-list))))
+
+(defun ecoin-llama--ring-stop ()
+  "Cancel the ring timer."
+  (when ecoin-llama--ring-timer
+    (cancel-timer ecoin-llama--ring-timer)
+    (setq ecoin-llama--ring-timer nil)))
+
+(defun ecoin-llama--ring-ensure-timer ()
+  "Start the ring timer unless it runs or the ring has no work."
+  (when (and (not ecoin-llama--ring-timer) (ecoin-llama--ring-alive-p))
+    (setq ecoin-llama--ring-timer
+          (run-with-timer ecoin-llama-ring-interval ecoin-llama-ring-interval
+                          #'ecoin-llama--ring-tick))))
+
+(defun ecoin-llama--warm-up (ring)
+  "Send the warm-up with RING's extra, unless the server already has it."
+  (unless (equal (cdr (ecoin-llama--ring-extra ring)) ecoin-llama--warmed)
+    (when-let* ((target (condition-case nil (ecoin-llama--target)
+                          (user-error nil))))
+      (ecoin-llama--start
+       (ecoin-llama--make-job :warmup t :ring ring :target target)))))
+
+(defun ecoin-llama--note-warmup (job)
+  "Record that the warm-up JOB finished."
+  (let ((chars (ecoin-llama--extra-chars (ecoin-llama--job-extra job))))
+    (setq ecoin-llama--last-warmup
+          (list :chunks (length (ecoin-llama--job-extra job)) :chars chars
+                :ms (round (* 1000 (- (float-time) (ecoin-llama--job-sent job))))))
+    (ecoin--log "warmup: %s" ecoin-llama--last-warmup)))
+
+(defun ecoin-llama--ring-promote ()
+  "Move one queued chunk into the ring and warm the server's cache with it.
+Only when a background request is allowed and the server is idle; never
+probes, since the ring has no business waking a sleeping model."
+  (when-let* ((last ecoin-llama--last-ring)
+              (ring (car last))
+              ((ecoin-llama--ring-queue ring))
+              ((ecoin-llama--background-ok-p))
+              ((not ecoin-llama--inflight))
+              ((not ecoin-llama--queued))
+              ((not (ecoin-llama--needs-probe-p))))
+    (ecoin-llama--evict-local ring (cdr last) t)
+    (when-let* ((chunk (car (ecoin-llama--ring-queue ring))))
+      (setf (ecoin-llama--ring-queue ring) (cdr (ecoin-llama--ring-queue ring))
+            (ecoin-llama--ring-chunks ring)
+            (last (append (ecoin-llama--ring-chunks ring) (list chunk))
+                  ecoin-llama-ring-chunks))
+      (cl-incf (ecoin-llama--ring-version ring))
+      (ecoin-llama--warm-up ring))))
+
+(defun ecoin-llama--ring-tick ()
+  "One ring update; stops the timer outside the activity window."
+  (if (not (ecoin-llama--ring-alive-p))
+      (ecoin-llama--ring-stop)
+    (ecoin--hook #'ecoin-llama--poll-kill)
+    (ecoin--hook #'ecoin-llama--ring-promote)))
 
 ;;;; Backend methods
 
@@ -1193,24 +1778,34 @@ accepting all of it."
 An automatic request is answered from the cache when it can be, at once."
   (ecoin-llama--note-activity)
   (let* ((manual (eq (ecoin-request-trigger request) 'manual))
+         (ring (ecoin-llama--current-ring t))
          (ctx (and (or manual (ecoin-llama--line-suffix-ok-p))
-                   (ecoin-llama--context))))
+                   (progn
+                     ;; Before the lookup: the cache key includes the extra.
+                     (ecoin-llama--evict-local ring (current-buffer))
+                     (ecoin-llama--context-for ring)))))
     (when ctx
-      (if-let* ((hit (and (not manual) (ecoin-llama--cache-lookup ctx))))
-          (ecoin-llama--call-with-items callback (car hit))
-        ;; Resolving the target first: a changed key or URL ends a backoff.
-        (let ((target (ecoin-llama--target-or-nil manual)))
-          (when (and target (or manual (not (ecoin-llama--in-backoff-p))))
-            (let ((job (ecoin-llama--make-job
-                        :buffer (ecoin-request-buffer request)
-                        :point (ecoin-request-point request)
-                        :tick (ecoin-request-tick request)
-                        :callback callback
-                        :ctx ctx
-                        :manual manual
-                        :target target)))
-              (ecoin-llama--submit job)
-              job)))))))
+      (setq ecoin-llama--last-ring (and ring (cons ring (current-buffer))))
+      (ecoin-llama--ring-ensure-timer))
+    (prog1
+        (when ctx
+          (if-let* ((hit (and (not manual) (ecoin-llama--cache-lookup ctx))))
+              (ecoin-llama--call-with-items callback (car hit))
+            ;; Resolving the target first: a changed key or URL ends a backoff.
+            (let ((target (ecoin-llama--target-or-nil manual)))
+              (when (and target (or manual (not (ecoin-llama--in-backoff-p))))
+                (let ((job (ecoin-llama--make-job
+                            :buffer (ecoin-request-buffer request)
+                            :point (ecoin-request-point request)
+                            :tick (ecoin-request-tick request)
+                            :callback callback
+                            :ctx ctx
+                            :ring ring
+                            :manual manual
+                            :target target)))
+                  (ecoin-llama--submit job)
+                  job)))))
+      (when ctx (ecoin--hook #'ecoin-llama--maybe-far-pick ring)))))
 
 (cl-defmethod ecoin-backend-shown ((_backend (eql 'llama)) item)
   "Prepare the cache for what the user does with the ghost of ITEM."
@@ -1272,18 +1867,30 @@ network."
   (ecoin-llama--reset t)
   (message "ecoin: llama state reset"))
 
+(defun ecoin-llama--ring-status ()
+  "Describe the ring of the current buffer's project."
+  (if-let* ((ring (and (> ecoin-llama-ring-chunks 0) (ecoin-llama--current-ring))))
+      (let ((extra (car (ecoin-llama--ring-extra ring))))
+        (format "ring %d chunks / %d queued / %d extra chars"
+                (length extra) (length (ecoin-llama--ring-queue ring))
+                (ecoin-llama--extra-chars extra)))
+    (if (> ecoin-llama-ring-chunks 0)
+        "ring 0 chunks / 0 queued / 0 extra chars"
+      "ring off")))
+
 (cl-defmethod ecoin-backend-status ((_backend (eql 'llama)))
   "Describe the server and the state of the connection."
   (let ((model (or (plist-get ecoin-llama--props :model_alias)
                    (plist-get ecoin-llama--props :model_path))))
-    (format "backend llama; state %s; url %s; model %s; slots %s; last error %s; backoff %s"
+    (format "backend llama; state %s; url %s; model %s; slots %s; last error %s; backoff %s; %s"
             ecoin-llama--state ecoin-llama-url (or model "unknown")
             (or (plist-get ecoin-llama--props :total_slots) "unknown")
             (or ecoin-llama--last-error "none")
             (if (ecoin-llama--in-backoff-p)
                 (format "%d s left"
                         (ceiling (- ecoin-llama--backoff-until (float-time))))
-              "none"))))
+              "none")
+            (ecoin-llama--ring-status))))
 
 (provide 'ecoin-llama)
 ;;; ecoin-llama.el ends here
