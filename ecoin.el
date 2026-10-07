@@ -13,14 +13,19 @@
 ;; selected with `ecoin-backend'.  Backends implement the `ecoin-backend-*'
 ;; generic functions below.
 ;;
-;; The only backend today is `copilot' (ecoin-copilot.el, the official
-;; `copilot-language-server' over JSON-RPC).  It is loaded on first use, so
-;; nothing Copilot-specific is required just by loading this file.
+;; Built-in backends are loaded on first use, so
+;; nothing backend-specific is required just by loading this file:
+;; `llama' (ecoin-llama.el, a llama.cpp server's /infill endpoint, the
+;; default) and `copilot' (ecoin-copilot.el, the official
+;; `copilot-language-server' over JSON-RPC).
 ;;
-;; Setup:
-;;   npm install -g @github/copilot-language-server
+;; Setup (llama):
+;;   llama-server --fim-qwen-1.5b-default
 ;;   (require 'ecoin)
 ;;   (add-hook 'prog-mode-hook #'ecoin-mode)
+;; Setup (copilot):
+;;   npm install -g @github/copilot-language-server
+;;   (setq ecoin-backend 'copilot)
 ;;   M-x ecoin-login          ; first time only
 ;;
 ;; While a suggestion is visible: TAB accepts it, C-TAB accepts one word,
@@ -39,10 +44,11 @@
   :group 'completion
   :prefix "ecoin-")
 
-(defcustom ecoin-backend 'copilot
+(defcustom ecoin-backend 'llama
   "Backend that supplies suggestions.
 A symbol on which the `ecoin-backend-*' generic functions dispatch."
-  :type '(choice (const :tag "GitHub Copilot" copilot)))
+  :type '(choice (const :tag "llama.cpp server (/infill)" llama)
+                 (const :tag "GitHub Copilot" copilot)))
 
 (defcustom ecoin-idle-delay 0.15
   "Seconds of idle time after an edit before asking for a suggestion."
@@ -163,6 +169,10 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
   "Return a plist of BACKEND capabilities, e.g. (:trigger-on-move t)."
   nil)
 
+(cl-defgeneric ecoin-backend-mode-line (_backend)
+  "Return a short string appended to the mode-line lighter, or nil."
+  nil)
+
 (cl-defgeneric ecoin-backend-available-p (_backend)
   "Return non-nil if BACKEND can serve requests right now."
   t)
@@ -171,7 +181,8 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
   "Restart BACKEND's server, if it has one.  The default does nothing."
   nil)
 
-(defconst ecoin--backend-features '((copilot . ecoin-copilot))
+(defconst ecoin--backend-features '((llama . ecoin-llama)
+                                    (copilot . ecoin-copilot))
   "Feature that provides each built-in backend, loaded on first use.")
 
 (defun ecoin--ensure-backend (backend)
@@ -576,13 +587,18 @@ Motion computed with the ghost on screen lands in the wrong column."
 
 ;;;; Minor mode
 
+(defun ecoin--lighter ()
+  "Mode-line text of `ecoin-mode': the name plus the backend's marker."
+  (concat " ecoin"
+          (or (ignore-errors (ecoin-backend-mode-line ecoin-backend)) "")))
+
 (defun ecoin--disable-buffer ()
   (ecoin--hook #'ecoin-backend-disable-buffer ecoin-backend))
 
 ;;;###autoload
 (define-minor-mode ecoin-mode
   "Show inline suggestions from `ecoin-backend' as ghost text."
-  :lighter " ecoin"
+  :lighter (:eval (ecoin--lighter))
   (if ecoin-mode
       (progn
         (setq ecoin--last-tick (buffer-chars-modified-tick)
