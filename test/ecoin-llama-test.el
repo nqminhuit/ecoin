@@ -2558,5 +2558,89 @@ The server answers every request; nothing but a prefetch can follow SETUP."
       (should-not ecoin-llama--last-ring)
       (should (= 0 (hash-table-count ecoin-llama--rings))))))
 
+;;;; Statistics
+
+(defun ecoin-llama-test--timed-answer (content)
+  "Handler: /infill answers CONTENT with fixed server timings."
+  (ecoin-llama-test--answer
+   (lambda (_) (list :body (list :content content
+                                 :timings/prompt_n 120 :timings/prompt_ms 40.4
+                                 :timings/predicted_n 8 :timings/predicted_ms 90.6
+                                 :timings/cache_n 500)))))
+
+(defun ecoin-llama-test--stat-rows ()
+  "The rows `ecoin-stats' gets from the llama backend."
+  (ecoin-backend-stats 'llama))
+
+(ert-deftest ecoin-llama-test-stats-count-hits-typed-through-and-misses ()
+  (ecoin-llama-test--with-server (ecoin-llama-test--timed-answer "foo(bar, baz)")
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin-stats-reset)
+      (ecoin-llama-test--show)                  ; miss
+      (ecoin-dismiss)
+      (ecoin--request 'auto)                    ; exact hit
+      (ecoin-dismiss)
+      (insert "foo(b")
+      (ecoin--request 'auto)                    ; typed-through hit
+      (should (equal "ar, baz)" (ecoin-llama-test--ghost)))
+      (should (equal '((exact . 1) (miss . 1) (typed . 1))
+                     (sort (copy-sequence ecoin-llama--stat-counts)
+                           (lambda (a b) (string< (symbol-name (car a))
+                                                  (symbol-name (car b)))))))
+      (should (equal "1 exact, 1 typed-through, 1 misses = 67% hit"
+                     (cdr (assoc "cache" (ecoin-llama-test--stat-rows)))))
+      (ecoin-stats-reset)
+      (should-not ecoin-llama--stat-counts))))
+
+(ert-deftest ecoin-llama-test-stats-timings-give-median-and-p95 ()
+  (ecoin-llama-test--with-server (ecoin-llama-test--timed-answer "foo")
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin-stats-reset)
+      (ecoin-llama-test--show 'manual)
+      (let ((rows (ecoin-llama-test--stat-rows)))
+        (should (equal "median 120, p95 120" (cdr (assoc "prompt_n" rows))))
+        (should (equal "median 500, p95 500" (cdr (assoc "cache_n" rows))))
+        (should (equal "median 91, p95 91" (cdr (assoc "predicted_ms" rows)))))
+      ;; A manual request is not a cache miss: it never looks in the cache.
+      (should-not (assoc "cache" (ecoin-llama-test--stat-rows)))
+      (ecoin-stats-reset))))
+
+(ert-deftest ecoin-llama-test-stats-count-prefetches ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--prefetch-answer "foo()\nbar()" "next")
+    (let ((ecoin-llama-prefetch t))
+      (ecoin-llama-test--in-buffer "x = "
+        (ecoin-stats-reset)
+        (ecoin-llama-test--show)
+        (should (ecoin-llama-test--wait
+                 (lambda () (and (= 2 (ecoin-llama-test--infills))
+                                 (null ecoin-llama--inflight)))))
+        (should (equal "1 prefetches, 0 warm-ups"
+                       (cdr (assoc "background" (ecoin-llama-test--stat-rows)))))
+        ;; The prefetch's timings are not the user's latency to a ghost.
+        (should (= 1 (ecoin--ring-count ecoin-llama--stat-timings)))
+        (ecoin-stats-reset)))))
+
+(ert-deftest ecoin-llama-test-stats-appear-in-the-report ()
+  (ecoin-llama-test--with-server (ecoin-llama-test--timed-answer "foo")
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin-stats-reset)
+      (ecoin-llama-test--show)
+      (ecoin-accept)
+      (let ((report (ecoin--stats-report)))
+        (should (string-match-p "^llama$" report))
+        (should (string-match-p "accepted +1 = 100% (full 1, partial 0" report))
+        (should (string-match-p "cache +0 exact, 0 typed-through, 1 misses = 0% hit"
+                                report))
+        (should (string-match-p "prompt_n +median 120" report)))
+      (ecoin-stats-reset))))
+
+(ert-deftest ecoin-llama-test-stats-recording-errors-do-not-escape ()
+  (let ((ecoin-llama--stat-counts 'not-an-alist)
+        (ecoin-llama--stat-timings nil))
+    (should-not (ecoin-llama--stat-count 'exact))
+    (should-not (ecoin-llama--stat-delivered
+                 (ecoin-llama--make-job :prefetch nil)))))
+
 (provide 'ecoin-llama-test)
 ;;; ecoin-llama-test.el ends here

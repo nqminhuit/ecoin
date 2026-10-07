@@ -799,5 +799,181 @@
     (should (equal "ecoin: stub is fine; fallback copilot: not started" msg))
     (should-not (featurep 'ecoin-copilot))))
 
+;;;; Statistics
+
+(defun ecoin-test--events (&optional kind)
+  "Recorded events, only of KIND if given; latency only if asked for."
+  (seq-filter (lambda (e) (if kind (eq (car e) kind) (not (eq (car e) 'latency))))
+              (ecoin--ring-items ecoin--stats)))
+
+(defmacro ecoin-test--with-stats (content &rest body)
+  "Like `ecoin-test--with-buffer', with empty statistics."
+  (declare (indent 1))
+  `(ecoin-test--with-buffer ,content
+     (ecoin-stats-reset)
+     ,@body))
+
+(ert-deftest ecoin-test-stats-shown-then-dismissed ()
+  (ecoin-test--with-stats ""
+    (ecoin-test--show "foo " "bar")
+    (should (equal '((shown ecoin-test-stub nil)) (ecoin-test--events)))
+    (ecoin-dismiss)
+    (should (equal '(shown dismissed) (mapcar #'car (ecoin-test--events))))
+    ;; Hiding a ghost that is already gone counts nothing.
+    (ecoin-dismiss)
+    (should (= 2 (length (ecoin-test--events))))))
+
+(ert-deftest ecoin-test-stats-each-accept-kind-counts-once-per-ghost ()
+  (dolist (case '((ecoin-accept "bar baz" full)
+                  (ecoin-accept-word "bar baz" word)
+                  (ecoin-accept-line "bar\nbaz" line)))
+    (ecoin-test--with-stats ""
+      (ecoin-test--show "x " (nth 1 case))
+      (funcall (car case))
+      (should (equal (list (nth 2 case))
+                     (mapcar #'caddr (ecoin-test--events 'accepted))))
+      (should-not (ecoin-test--events 'dismissed))
+      ;; A partial accept leaves a ghost: finishing it is no second accept,
+      ;; and clearing it afterwards is no dismissal either.
+      (when (ecoin--visible-p)
+        (ecoin-accept)
+        (should (= 1 (length (ecoin-test--events 'accepted)))))
+      (ecoin-dismiss)
+      (should-not (ecoin-test--events 'dismissed)))))
+
+(ert-deftest ecoin-test-stats-word-that-takes-everything-is-full ()
+  (ecoin-test--with-stats ""
+    (ecoin-test--show "x " "bar")
+    (ecoin-accept-word)
+    (should (equal '(full) (mapcar #'caddr (ecoin-test--events 'accepted))))))
+
+(ert-deftest ecoin-test-stats-typed-through-to-the-end-is-an-accept ()
+  (ecoin-test--with-stats ""
+    (ecoin-test--show "x " "ab")
+    (let ((this-command 'self-insert-command))
+      (insert "a")
+      (should (ecoin--typed-into-ghost))
+      (should-not (ecoin-test--events 'accepted))
+      (insert "b")
+      (should (ecoin--typed-into-ghost)))
+    (should (equal '(typed) (mapcar #'caddr (ecoin-test--events 'accepted))))
+    (should-not (ecoin-test--events 'dismissed))
+    (should-not ecoin--stat-session)))
+
+(ert-deftest ecoin-test-stats-typing-something-else-dismisses ()
+  (ecoin-test--with-stats ""
+    (ecoin-test--show "x " "ab")
+    (let ((this-command 'self-insert-command))
+      (insert "z")
+      (ecoin--post-command))
+    (should (equal '(shown dismissed) (mapcar #'car (ecoin-test--events))))))
+
+(ert-deftest ecoin-test-stats-cycling-is-one-session ()
+  (ecoin-test--with-stats ""
+    (insert "x ")
+    (setq ecoin-test--items (list (ecoin-test--item "a") (ecoin-test--item "b")))
+    (ecoin--request 'manual)
+    (ecoin-next)
+    (should (= 2 (length (ecoin-test--events 'shown))))
+    (should-not (ecoin-test--events 'dismissed))
+    (ecoin-dismiss)
+    (should (= 1 (length (ecoin-test--events 'dismissed))))))
+
+(ert-deftest ecoin-test-stats-latency-runs-from-the-request-to-the-ghost ()
+  (ecoin-test--with-stats "x "
+    (let ((now 100.0))
+      (cl-letf (((symbol-function 'float-time) (lambda (&optional _) now)))
+        (setq ecoin-test--defer t
+              ecoin-test--items (list (ecoin-test--item "foo")))
+        (ecoin--request 'manual)
+        (setq now 100.25)
+        (funcall (car ecoin-test--callbacks) ecoin-test--items)))
+    (should (= 1 (length (ecoin-test--events 'latency))))
+    (should (= 1 (length (ecoin-test--events 'shown))))
+    (should (< (abs (- 0.25 (caddr (car (ecoin-test--events 'latency))))) 1e-6))))
+
+(ert-deftest ecoin-test-stats-no-latency-for-a-stale-or-empty-answer ()
+  (ecoin-test--with-stats "x "
+    (setq ecoin-test--items nil)
+    (ecoin--request 'manual)
+    (should-not (ecoin-test--events))))
+
+(ert-deftest ecoin-test-stats-ring-keeps-the-newest-500 ()
+  (ecoin-stats-reset)
+  (dotimes (i 700) (ecoin--stat 'latency 'b (float i)))
+  (let ((events (ecoin--ring-items ecoin--stats)))
+    (should (= 500 (length events)))
+    (should (= 200.0 (caddr (car events))))
+    (should (= 699.0 (caddr (car (last events))))))
+  (ecoin-stats-reset))
+
+(ert-deftest ecoin-test-stats-reset-clears-everything ()
+  (ecoin-test--with-stats ""
+    (ecoin-test--show "x " "bar")
+    (ecoin-accept)
+    (should (ecoin-test--events))
+    (let (msg)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+        (ecoin-stats-reset))
+      (should msg))
+    (should-not (ecoin-test--events))
+    (should (string-match-p "No ecoin events" (ecoin--stats-report)))))
+
+(defun ecoin-test--seed-stats ()
+  "A scripted history for stub: latencies 0.1..1.0 s and ten ghosts."
+  (ecoin-stats-reset)
+  (dotimes (i 10)
+    (ecoin--stat 'latency 'ecoin-test-stub (* 0.1 (1+ i)))
+    (ecoin--stat 'shown 'ecoin-test-stub))
+  (dolist (kind '(full full word line))
+    (ecoin--stat 'accepted 'ecoin-test-stub kind))
+  (dotimes (_ 3) (ecoin--stat 'dismissed 'ecoin-test-stub)))
+
+(ert-deftest ecoin-test-stats-report-has-the-expected-numbers ()
+  (ecoin-test--seed-stats)
+  (let ((report (ecoin--stats-report)))
+    (should (string-match-p "^ecoin-test-stub$" report))
+    (should (string-match-p "p50 500 ms, p95 1000 ms (10 ghosts" report))
+    (should (string-match-p "shown +10$" report))
+    (should (string-match-p "accepted +4 = 40% (full 2, partial 2: word 1, line 1)" report))
+    (should (string-match-p "dismissed +3$" report)))
+  (ecoin-stats-reset))
+
+(ert-deftest ecoin-test-stats-command-fills-a-read-only-buffer ()
+  (ecoin-test--seed-stats)
+  (unwind-protect
+      (cl-letf (((symbol-function 'display-buffer) #'ignore))
+        (ecoin-stats)
+        (with-current-buffer "*ecoin-stats*"
+          (should buffer-read-only)
+          (should (string-match-p "p50 500 ms" (buffer-string)))))
+    (kill-buffer "*ecoin-stats*")
+    (ecoin-stats-reset)))
+
+(defvar ecoin-test--stats-fail nil "Non-nil: the stub's stats method signals.")
+
+(cl-defmethod ecoin-backend-stats ((_backend (eql 'ecoin-test-stub)))
+  (if ecoin-test--stats-fail
+      (error "stats boom")
+    '(("extra" . "42 things"))))
+
+(ert-deftest ecoin-test-stats-backend-rows-are-appended ()
+  (ecoin-test--seed-stats)
+  (should (string-match-p "extra +42 things" (ecoin--stats-report)))
+  (ecoin-stats-reset))
+
+(ert-deftest ecoin-test-stats-errors-never-escape ()
+  (ecoin-test--seed-stats)
+  (let ((ecoin-test--stats-fail t))
+    ;; A failing backend method costs its rows, not the report.
+    (should (string-match-p "shown +10" (ecoin--stats-report))))
+  (ecoin-stats-reset)
+  ;; Recording into a broken ring is swallowed: it runs inside post-command.
+  (let ((ecoin--stats nil))
+    (should-not (ecoin--stat 'shown 'b))
+    (let ((ecoin--stat-session (cons 'b nil)))
+      (should-not (ecoin--stat-accepted 'full)))))
+
 (provide 'ecoin-test)
 ;;; ecoin-test.el ends here

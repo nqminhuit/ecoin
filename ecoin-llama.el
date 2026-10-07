@@ -1,6 +1,6 @@
 ;;; ecoin-llama.el --- llama.cpp /infill backend for ecoin  -*- lexical-binding: t; -*-
 
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, completion
 ;; URL: https://github.com/nqminhuit/ecoin
@@ -194,6 +194,11 @@ Lower than for a user request because a prefetch holds the single flight."
 (defvar ecoin-llama--last-timings nil "Server timings of the last completion.")
 (defvar ecoin-llama--last-activity nil
   "`float-time' of the last user trigger; background requests need it recent.")
+;; Statistics for `ecoin-stats': counters, and the server timings of the last
+;; `ecoin--stats-size' completions.
+(defvar ecoin-llama--stat-counts nil "Alist (KEY . COUNT) of cache and request counters.")
+(defvar ecoin-llama--stat-timings (ecoin--make-ring ecoin--stats-size)
+  "Ring of plists of server timings, one per completion a user asked for.")
 (defvar ecoin-llama--prefetch-timer nil "Timer that sends the pending prefetch.")
 (defvar ecoin-llama--rings (make-hash-table :test #'equal)
   "Project root to its `ecoin-llama--ring'.")
@@ -853,6 +858,22 @@ once, unless the returned connection is cancelled."
                        ((consp body) body))))
     (seq-filter #'stringp (mapcar (lambda (o) (plist-get o :content)) objects))))
 
+(defun ecoin-llama--stat-count (key)
+  "Count one KEY for `ecoin-stats'; never signals."
+  (condition-case nil
+      (cl-incf (alist-get key ecoin-llama--stat-counts 0))
+    (error nil)))
+
+(defun ecoin-llama--stat-delivered (job)
+  "Record the completion JOB just received; never signals."
+  (condition-case nil
+      (cond ((ecoin-llama--job-prefetch job) (ecoin-llama--stat-count 'prefetch))
+            (t (unless (ecoin-llama--job-manual job)
+                 (ecoin-llama--stat-count 'miss))
+               (ecoin--ring-push ecoin-llama--stat-timings
+                                 (copy-sequence ecoin-llama--last-timings))))
+    (error nil)))
+
 (defun ecoin-llama--deliver (job body)
   "Post-process BODY and hand the items to JOB's callback if still current."
   (let ((buffer (ecoin-llama--job-buffer job))
@@ -864,6 +885,7 @@ once, unless the returned connection is cancelled."
                 :predicted_ms (plist-get body :timings/predicted_ms)
                 :cache_n (plist-get body :timings/cache_n)))
     (ecoin--log "infill: %s" ecoin-llama--last-timings)
+    (ecoin-llama--stat-delivered job)
     ;; Whatever happened to the context meanwhile, the answer is still good.
     ;; A blank answer to a guess must not become a zero-request "no ghost"
     ;; hit when the user really gets there.
@@ -1183,9 +1205,11 @@ Exact key first, then typed-through reuse."
          (key (ecoin-llama--cache-key before suffix id)))
     (if-let* ((hit (gethash key ecoin-llama--cache)))
         (progn (ecoin-llama--cache-touch key)
+               (ecoin-llama--stat-count 'exact)
                (list (ecoin-llama--items hit)))
       (when (> (hash-table-count ecoin-llama--cache) 0)
         (when-let* ((items (ecoin-llama--cache-typed-through before suffix id)))
+          (ecoin-llama--stat-count 'typed)
           (list items))))))
 
 (defun ecoin-llama--call-with-items (callback items)
@@ -1724,6 +1748,7 @@ also evicts from the queue."
 (defun ecoin-llama--note-warmup (job)
   "Record that the warm-up JOB finished."
   (let ((chars (ecoin-llama--extra-chars (ecoin-llama--job-extra job))))
+    (ecoin-llama--stat-count 'warmup)
     (setq ecoin-llama--last-warmup
           (list :chunks (length (ecoin-llama--job-extra job)) :chars chars
                 :ms (round (* 1000 (- (float-time) (ecoin-llama--job-sent job))))))
@@ -1807,6 +1832,44 @@ An automatic request is answered from the cache when it can be, at once."
                   (ecoin-llama--submit job)
                   job)))))
       (when ctx (ecoin--hook #'ecoin-llama--maybe-far-pick ring)))))
+
+(defconst ecoin-llama--stat-timing-keys
+  '(:prompt_n :cache_n :prompt_ms :predicted_n :predicted_ms)
+  "Server timings summarized by `ecoin-stats'.")
+
+(cl-defmethod ecoin-backend-stats ((_backend (eql 'llama)))
+  "Cache, prefetch and server-timing rows for `ecoin-stats'."
+  (let* ((count (lambda (key) (alist-get key ecoin-llama--stat-counts 0)))
+         (exact (funcall count 'exact))
+         (typed (funcall count 'typed))
+         (miss (funcall count 'miss))
+         (total (+ exact typed miss))
+         (timings (ecoin--ring-items ecoin-llama--stat-timings)))
+    (append
+     (when (> total 0)
+       (list (cons "cache"
+                   (format "%d exact, %d typed-through, %d misses = %d%% hit"
+                           exact typed miss (round (* 100.0 (+ exact typed)) total)))))
+     (list (cons "background"
+                 (format "%d prefetches, %d warm-ups"
+                         (funcall count 'prefetch) (funcall count 'warmup))))
+     (cl-loop for key in ecoin-llama--stat-timing-keys
+              for values = (sort (delq nil (mapcar (lambda (tm) (plist-get tm key))
+                                                   timings))
+                                 #'<)
+              when values
+              collect (cons (substring (symbol-name key) 1)
+                            (format "median %s, p95 %s"
+                                    (ecoin-llama--stat-num (ecoin--percentile values 0.5))
+                                    (ecoin-llama--stat-num (ecoin--percentile values 0.95))))))))
+
+(defun ecoin-llama--stat-num (n)
+  "N, a number, formatted compactly."
+  (if (integerp n) (format "%d" n) (format "%.0f" n)))
+
+(cl-defmethod ecoin-backend-stats-reset ((_backend (eql 'llama)))
+  (setq ecoin-llama--stat-counts nil)
+  (ecoin--ring-clear ecoin-llama--stat-timings))
 
 (cl-defmethod ecoin-backend-shown ((_backend (eql 'llama)) item)
   "Prepare the cache for what the user does with the ghost of ITEM."
