@@ -44,8 +44,11 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
                   0)))
       (when (and (>= (length body) len)
                  (string-match "\\`\\([A-Z]+\\) \\([^ ]+\\) HTTP/1.1" head))
-        (list :method (match-string 1 head) :path (match-string 2 head)
-              :head head :body body :raw raw)))))
+        (let ((method (match-string 1 head))
+              (target (split-string (match-string 2 head) "?")))
+          ;; :path has no query, so handlers compare it with the constants.
+          (list :method method :path (car target) :query (cadr target)
+                :head head :body body :raw raw))))))
 
 (defun ecoin-llama-test--reply-bytes (reply)
   "The HTTP response bytes for the reply plist REPLY."
@@ -168,6 +171,8 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
           (ecoin-llama-request-timeout 2)
           (ecoin-llama-retry-delay 0.01)
           (ecoin-llama-prefetch nil)
+          (ecoin-llama-model nil)
+          (ecoin-llama--last-model nil)
           (orig-http (symbol-function 'ecoin-llama--http)))
      (ecoin-llama--reset)
      (unwind-protect
@@ -2641,6 +2646,222 @@ The server answers every request; nothing but a prefetch can follow SETUP."
     (should-not (ecoin-llama--stat-count 'exact))
     (should-not (ecoin-llama--stat-delivered
                  (ecoin-llama--make-job :prefetch nil)))))
+
+;;;; Model selection (llama.cpp router)
+
+(defconst ecoin-llama-test--not-loaded
+  '(:error (:code 400 :message "model is not loaded"
+            :type "invalid_request_error")))
+(defconst ecoin-llama-test--not-found
+  '(:error (:code 400 :message "model 'nope.gguf' not found"
+            :type "invalid_request_error")))
+(defconst ecoin-llama-test--router-stub
+  '(:role "router" :model_path "none"))
+
+(defun ecoin-llama-test--router-handler (props-reply)
+  "A handler answering /props with PROPS-REPLY and /infill with \"ghost\"."
+  (lambda (r)
+    (if (equal (plist-get r :path) ecoin-llama--path-props)
+        props-reply
+      '(:body (:content "ghost")))))
+
+(defun ecoin-llama-test--job-body (job)
+  "The request body of JOB, as the server would parse it."
+  (ecoin-llama--parse-json (decode-coding-string
+                            (ecoin-llama--encode-body
+                             (ecoin-llama--request-body job))
+                            'utf-8)))
+
+(ert-deftest ecoin-llama-test-model-in-completion-and-warmup-bodies ()
+  (let ((ctx (list :prefix "" :middle "" :suffix "\n" :n-indent 0))
+        (ecoin-llama-sampling '(:top_k 10 :model "from-sampling")))
+    (dolist (job (list (ecoin-llama--make-job :ctx ctx)
+                       (ecoin-llama--make-job :warmup t)))
+      (let ((ecoin-llama-model nil))
+        (should-not (plist-member (ecoin-llama-test--job-body job) :model)))
+      (let ((ecoin-llama-model "qwen.gguf"))
+        (should (equal "qwen.gguf"
+                       (plist-get (ecoin-llama-test--job-body job) :model)))))))
+
+(ert-deftest ecoin-llama-test-model-default-body-is-unchanged ()
+  (let ((ctx (list :prefix "p" :middle "m" :suffix "s" :n-indent 0))
+        (ecoin-llama-model nil))
+    (should-not (plist-member (ecoin-llama--request-body
+                               (ecoin-llama--make-job :ctx ctx))
+                              :model))))
+
+(ert-deftest ecoin-llama-test-props-path ()
+  (let ((ecoin-llama-model nil))
+    (should (equal "/props" (ecoin-llama--props-path))))
+  (let ((ecoin-llama-model "m.gguf"))
+    (should (equal "/props?model=m.gguf&autoload=false"
+                   (ecoin-llama--props-path))))
+  (let ((ecoin-llama-model "org/m b:Q4 \u00e9"))
+    (should (equal "/props?model=org%2Fm%20b%3AQ4%20%C3%A9&autoload=false"
+                   (ecoin-llama--props-path)))))
+
+(ert-deftest ecoin-llama-test-probe-sends-the-model-query ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler (list :body ecoin-llama-test--props))
+    (let ((ecoin-llama-model "a/b.gguf"))
+      (ecoin-llama-test--in-buffer "foo("
+        (ecoin-llama-test--show)
+        (let ((props (car ecoin-llama-test--requests)))
+          (should (equal "/props" (plist-get props :path)))
+          (should (equal "model=a%2Fb.gguf&autoload=false"
+                         (plist-get props :query)))
+          (should-not (string-match-p "[^ -~\r\n]" (plist-get props :head))))
+        (should (equal "a/b.gguf"
+                       (plist-get (car (ecoin-llama-test--infill-bodies))
+                                  :model)))))))
+
+(ert-deftest ecoin-llama-test-no-model-probes-plain-props ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler (list :body ecoin-llama-test--props))
+    (ecoin-llama-test--in-buffer "foo("
+      (ecoin-llama-test--show)
+      (should (null (plist-get (car ecoin-llama-test--requests) :query)))
+      (should-not (plist-member (car (ecoin-llama-test--infill-bodies)) :model)))))
+
+(ert-deftest ecoin-llama-test-invalid-model-is-a-config-error ()
+  (dolist (bad '("" "  " 5 :x))
+    (let ((ecoin-llama-model bad))
+      (should-error (ecoin-llama--target) :type 'user-error))))
+
+(ert-deftest ecoin-llama-test-router-model-not-loaded-still-sends-the-request ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler
+       (list :status 400 :body ecoin-llama-test--not-loaded))
+    (let ((ecoin-llama-model "m.gguf")
+          (ecoin-llama-wake-timeout 77))
+      (ecoin-llama-test--in-buffer "foo("
+        (ecoin-llama-test--show 'manual)
+        (should (= 1 (ecoin-llama-test--infills)))
+        (should (ecoin-llama-test--messages-matching "loading m\\.gguf"))
+        (should (equal '(77) (mapcar #'cadr (seq-filter
+                                             (lambda (c)
+                                               (equal (car c) ecoin-llama--path-infill))
+                                             ecoin-llama-test--calls))))
+        (should (eq 'ready ecoin-llama--state))))))
+
+(ert-deftest ecoin-llama-test-router-model-not-loaded-spares-background-jobs ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler
+       (list :status 400 :body ecoin-llama-test--not-loaded))
+    (let ((ecoin-llama-model "m.gguf"))
+      (ecoin-llama--target)
+      (ecoin-llama-test--with-ring ring
+        (let ((target (ecoin-llama--target))
+              (ctx (list :prefix "" :middle "" :suffix "\n" :n-indent 0)))
+          (dolist (job (list (ecoin-llama--make-job :warmup t :ring ring
+                                                    :target target)
+                             (ecoin-llama--make-job :prefetch t :ctx ctx
+                                                    :ring ring :target target)))
+            ;; Healthy long ago, so the job must probe.
+            (setq ecoin-llama--state 'ready
+                  ecoin-llama--last-ok (- (float-time)
+                                          (* 2 ecoin-llama-reprobe-after)))
+            (ecoin-llama--start job)
+            (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+            (should (eq 'sleeping ecoin-llama--state))))
+        (ecoin-llama-test--settle)
+        (should (= 2 (ecoin-llama-test--count ecoin-llama--path-props)))
+        (should (= 0 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-router-unknown-model-fails-with-backoff ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler
+       (list :status 400 :body ecoin-llama-test--not-found))
+    (let ((ecoin-llama-model "nope.gguf"))
+      (ecoin-llama-test--in-buffer "foo("
+        (ecoin--request 'auto)
+        (should (ecoin-llama-test--wait (lambda () (eq 'error ecoin-llama--state))))
+        (should (ecoin-llama-test--messages-matching
+                 "no model nope\\.gguf; check `ecoin-llama-model'"))
+        (should (ecoin-llama--in-backoff-p))
+        (should-not ecoin-llama--config-failed)
+        (should-not (ecoin-backend-available-p 'llama))
+        (let ((seen (length ecoin-llama-test--requests)))
+          (insert "x")
+          (ecoin--request 'auto)
+          (ecoin-llama-test--settle)
+          (should (= seen (length ecoin-llama-test--requests))))
+        (should (= 0 (ecoin-llama-test--infills)))
+        (should-not (ecoin-backend-available-p 'llama))))))
+
+(ert-deftest ecoin-llama-test-router-loading-model-is-loading ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler
+       '(:status 503 :body (:error (:message "Loading model"
+                                    :type "unavailable_error" :code 503))))
+    (let ((ecoin-llama-model "m.gguf"))
+      (ecoin-llama-test--in-buffer "foo("
+        (ecoin--request 'auto)
+        (should (ecoin-llama-test--wait (lambda () (eq 'loading ecoin-llama--state))))
+        (should (= 0 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-router-unexpected-400-is-a-generic-error ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler
+       '(:status 400 :body (:error (:message "something else"))))
+    (let ((ecoin-llama-model "m.gguf"))
+      (ecoin-llama-test--in-buffer "foo("
+        (ecoin--request 'auto)
+        (should (ecoin-llama-test--wait (lambda () (eq 'error ecoin-llama--state))))
+        (should (ecoin-llama-test--messages-matching "answered 400: something else"))
+        (should (= 0 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-router-without-model-fails-with-backoff ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler (list :body ecoin-llama-test--router-stub))
+    (ecoin-llama-test--in-buffer "foo("
+      (ecoin--request 'auto)
+      (should (ecoin-llama-test--wait (lambda () (eq 'error ecoin-llama--state))))
+      (should (ecoin-llama-test--messages-matching
+               "is a llama\\.cpp router; set `ecoin-llama-model'"))
+      (should (ecoin-llama--in-backoff-p))
+      (should-not ecoin-llama--config-failed)
+      (should-not (ecoin-backend-available-p 'llama))
+      (should (= 0 (ecoin-llama-test--infills))))))
+
+(ert-deftest ecoin-llama-test-model-change-clears-cache-and-reprobes ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--router-handler (list :body ecoin-llama-test--props))
+    (ecoin-llama-test--in-buffer "foo("
+      (let ((ecoin-llama-model "a.gguf"))
+        (ecoin-llama-test--show)
+        (ecoin-llama-test--show)        ; cache hit
+        (should (= 1 (ecoin-llama-test--infills)))
+        (should (= 1 (ecoin-llama-test--count ecoin-llama--path-props))))
+      (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight)))
+      (let ((ecoin-llama-model "b.gguf"))
+        (ecoin--request 'auto)
+        (should (ecoin-llama-test--wait (lambda () (= 2 (ecoin-llama-test--infills)))))
+        (should (= 2 (ecoin-llama-test--count ecoin-llama--path-props)))
+        (should (equal "b.gguf"
+                       (plist-get (cadr (ecoin-llama-test--infill-bodies))
+                                  :model)))))))
+
+(ert-deftest ecoin-llama-test-unchanged-model-does-not-reset ()
+  (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+    (let ((ecoin-llama-model "a.gguf"))
+      (ecoin-llama--target)
+      (ecoin-llama-test--prime-ready)
+      (ecoin-llama--target)
+      (should (eq 'ready ecoin-llama--state)))
+    (let ((ecoin-llama-model nil))
+      (ecoin-llama--target)
+      (should (eq 'unknown ecoin-llama--state)))))
+
+(ert-deftest ecoin-llama-test-status-names-the-configured-model ()
+  (let ((ecoin-llama-url "http://127.0.0.1:1")
+        (ecoin-llama--props '(:total_slots 1 :model_path "/m/q.gguf"))
+        (ecoin-llama-model "q.gguf"))
+    (should (string-match-p "model q\\.gguf (server: /m/q\\.gguf);"
+                            (ecoin-backend-status 'llama)))
+    (let ((ecoin-llama-model nil))
+      (should (string-match-p "model /m/q\\.gguf;"
+                              (ecoin-backend-status 'llama))))))
 
 (provide 'ecoin-llama-test)
 ;;; ecoin-llama-test.el ends here
