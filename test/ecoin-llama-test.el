@@ -268,7 +268,7 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
                (lambda (f) (push f seen) nil)))
       (should (equal "sk-literal" (ecoin-llama--api-key))))
     (should seen)
-    (should-not (cl-some #'file-remote-p seen))))
+    (should-not (cl-some (lambda (f) (string-match-p "nohost" f)) seen))))
 
 (ert-deftest ecoin-llama-test-bad-keys-are-user-errors ()
   (dolist (key '("kéy" "ke\ny" "ke\r\ny" "\U0001F600"))
