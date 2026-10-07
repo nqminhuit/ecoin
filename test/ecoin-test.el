@@ -470,6 +470,52 @@
         (should (eq (and cap t) (and ecoin--timer t)))
         (ecoin--cancel-timer)))))
 
+(ert-deftest ecoin-test-full-accept-requests-the-next-ghost-with-the-capability ()
+  (cl-letf (((symbol-function 'ecoin-backend-capabilities)
+             (lambda (_backend) '(:trigger-on-move t))))
+    ;; Accept command.
+    (ecoin-test--with-buffer "foo"
+      (setq ecoin-test--items (list (ecoin-test--item "bar")))
+      (ecoin--request 'manual)
+      (let ((before ecoin--request-counter))
+        (setq ecoin-test--items (list (ecoin-test--item "baz")))
+        (ecoin-accept)
+        (should (= (1+ before) ecoin--request-counter))
+        (should (equal "foobar" (buffer-string)))
+        (should (equal "baz" (ecoin-test--ghost)))
+        ;; The command loop's post-command hook keeps it.
+        (let ((this-command 'ecoin-accept)) (ecoin--post-command))
+        (should (equal "baz" (ecoin-test--ghost)))))
+    ;; Typing the last character.
+    (ecoin-test--with-buffer "foo"
+      (setq ecoin-test--items (list (ecoin-test--item "b")))
+      (ecoin--request 'manual)
+      (let ((before ecoin--request-counter))
+        (setq ecoin-test--items (list (ecoin-test--item "next")))
+        (setq this-command 'self-insert-command)
+        (insert "b")
+        (ecoin--post-command)
+        (should (= (1+ before) ecoin--request-counter))
+        (should (equal "next" (ecoin-test--ghost))))))
+  ;; Partial accepts do not ask.
+  (cl-letf (((symbol-function 'ecoin-backend-capabilities)
+             (lambda (_backend) '(:trigger-on-move t))))
+    (ecoin-test--with-buffer "foo"
+      (setq ecoin-test--items (list (ecoin-test--item "bar baz")))
+      (ecoin--request 'manual)
+      (let ((before ecoin--request-counter))
+        (ecoin-accept-word)
+        (should (= before ecoin--request-counter))))))
+
+(ert-deftest ecoin-test-full-accept-sends-nothing-without-the-capability ()
+  (ecoin-test--with-buffer "foo"
+    (setq ecoin-test--items (list (ecoin-test--item "bar")))
+    (ecoin--request 'manual)
+    (let ((before ecoin--request-counter))
+      (ecoin-accept)
+      (should (= before ecoin--request-counter))
+      (should-not (ecoin-test--ghost)))))
+
 (ert-deftest ecoin-test-an-edit-schedules-a-request-without-the-capability ()
   (ecoin-test--with-buffer "foo"
     (insert "d")

@@ -778,8 +778,14 @@ once, unless the returned connection is cancelled."
                 :cache_n (plist-get body :timings/cache_n)))
     (ecoin--log "infill: %s" ecoin-llama--last-timings)
     ;; Whatever happened to the context meanwhile, the answer is still good.
-    (ecoin-llama--cache-store (ecoin-llama--job-ctx job)
-                              (ecoin-llama--contents body))
+    ;; A blank answer to a guess must not become a zero-request "no ghost"
+    ;; hit when the user really gets there.
+    (ecoin-llama--cache-store
+     (ecoin-llama--job-ctx job)
+     (if (ecoin-llama--job-prefetch job)
+         (seq-filter (lambda (c) (string-match-p "[^ \t\n]" c))
+                     (ecoin-llama--contents body))
+       (ecoin-llama--contents body)))
     (when (and callback (buffer-live-p buffer))
       (with-current-buffer buffer
         (when (and (= (point) (ecoin-llama--job-point job))

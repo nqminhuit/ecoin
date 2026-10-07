@@ -1377,12 +1377,44 @@ The prefetch answer comes DELAY seconds late."
                                  (null ecoin-llama--inflight)))))
         (ecoin-accept)
         (should (equal "x = foo()\nbar()" (buffer-string)))
-        (ecoin--request 'auto)
+        ;; No manual request: accepting asks for the next ghost itself.
         (should (equal "next" (ecoin-llama-test--ghost)))
         ;; Nothing was sent for it; the next prefetch comes after.
         (should (= 2 (ecoin-llama-test--infills)))
         (should (ecoin-llama-test--wait
                  (lambda () (= 3 (ecoin-llama-test--infills)))))))))
+
+(ert-deftest ecoin-llama-test-blank-answers-cached-for-user-requests-only ()
+  ;; A blank prefetch answer is dropped: reaching that context later asks.
+  (let ((n 0))
+    (ecoin-llama-test--with-server
+        (ecoin-llama-test--answer
+         (lambda (body)
+           (if (equal (plist-get body :t_max_predict_ms)
+                      ecoin-llama-test--prefetch-ms)
+               "\n"
+             (if (= 1 (cl-incf n)) "foo()" "later"))))
+      (let ((ecoin-llama-prefetch t))
+        (ecoin-llama-test--in-buffer "x = "
+          (ecoin-llama-test--show)
+          (should (ecoin-llama-test--wait
+                   (lambda () (and (= 2 (ecoin-llama-test--infills))
+                                   (null ecoin-llama--inflight)))))
+          (should-not (ecoin-llama--cache-has-p
+                       (ecoin-llama--context "foo()")))
+          (ecoin-accept)
+          ;; Not a zero-request empty hit: the accept's request goes out.
+          (should (ecoin-llama-test--wait
+                   (lambda () (equal "later" (ecoin-llama-test--ghost)))))
+          (should (>= (ecoin-llama-test--infills) 3))))))
+  ;; A blank answer to a user request is cached.
+  (ecoin-llama-test--with-server (ecoin-llama-test--answer (lambda (_) "\n"))
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin--request 'auto)
+      (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+      (should (ecoin-llama--cache-has-p (ecoin-llama--context)))
+      (ecoin--request 'auto)
+      (should (= 1 (ecoin-llama-test--infills))))))
 
 (ert-deftest ecoin-llama-test-prefetch-is-off-when-the-option-is-nil ()
   (ecoin-llama-test--with-server
