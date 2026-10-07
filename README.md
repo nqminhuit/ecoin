@@ -17,7 +17,7 @@ Run a llama-server with a FIM-capable model, for example `llama-server --fim-qwe
       ecoin-llama-api-key "~/.llama-key")       ; nil, a key, a file holding it, or a function
 ```
 
-Only requests to `ecoin-llama-url` are made, and nothing is sent for files matching `ecoin-exclude-file-regexps`. If the server is down, asleep, loading, rejects the key or has no FIM tokens, ecoin shows one message, a mode-line marker (`ecoin[z]` sleeping, `ecoin[!]` failing) and backs off instead of failing on every keystroke; `M-x ecoin-status` shows the state and `M-x ecoin-restart` resets it. `ecoin-complete` asks for several alternatives (M-n / M-p), up to the server's slot count.
+Only requests to `ecoin-llama-url` are made, and nothing is sent for files matching `ecoin-exclude-file-regexps`. If the server is down, asleep, loading, rejects the key or has no FIM tokens, ecoin shows one message, a mode-line marker (`ecoin[z]` sleeping, `ecoin[!]` failing) and backs off instead of failing on every keystroke; `M-x ecoin-status` shows the state and `M-x ecoin-restart` resets it. `ecoin-complete` asks for several alternatives (M-n / M-p), up to the server's slot count. Answers are cached (`ecoin-llama-cache-size`), so repeating or typing through a suggestion costs no request, and after a suggestion is shown ecoin asks ahead for the one that follows accepting it (`ecoin-llama-prefetch`, only within `ecoin-llama-activity-window` seconds of your last trigger).
 
 ## Fallback to another backend
 

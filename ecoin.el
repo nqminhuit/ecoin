@@ -361,6 +361,19 @@ Announces each switch once.  Sends nothing."
     (message "ecoin: %s is back" (ecoin--backend-label primary))
     (force-mode-line-update t)))
 
+(defun ecoin--trigger-on-move-p ()
+  "Non-nil if the backend now in use asks for requests on cursor moves."
+  (plist-get (ecoin-backend-capabilities (or (ecoin--fallback-in-use)
+                                             ecoin-backend))
+             :trigger-on-move))
+
+(defun ecoin--after-full-accept ()
+  "Ask for the next suggestion at once after a whole one was accepted.
+Only for backends that follow the cursor; for llama it is usually a cache
+hit on the prefetched continuation."
+  (when (and (ecoin--trigger-on-move-p) (ecoin--allowed-p))
+    (ecoin--request 'auto)))
+
 (defun ecoin--request (trigger)
   "Ask the backend for suggestions at point.
 TRIGGER is `auto' or `manual'."
@@ -487,7 +500,8 @@ Typing the last char accepts the item."
             (ecoin--display (ecoin--remainder item 1 end))
           (ecoin--clear-overlay)
           (delete-region (point) (max (point) end))
-          (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item ghost nil))
+          (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item ghost nil)
+          (ecoin--after-full-accept))
         t))))
 
 ;;;; Accepting
@@ -531,7 +545,8 @@ their suggestion."
           (ecoin--display (ecoin--remainder item (length text) (+ end (length text)))))
       (delete-region (point) (max (point) end))
       (insert text)
-      (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item text nil))))
+      (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item text nil)
+      (ecoin--after-full-accept))))
 
 (defun ecoin-accept ()
   "Accept the whole suggestion."
@@ -614,11 +629,7 @@ Motion computed with the ghost on screen lands in the wrong column."
   (let* ((changed (not (eq ecoin--last-tick (buffer-chars-modified-tick))))
          (moved (not (eql ecoin--last-point (point))))
          (trigger (cond (changed 'auto)
-                        ((and moved
-                              (plist-get (ecoin-backend-capabilities
-                                    (or (ecoin--fallback-in-use) ecoin-backend))
-                                         :trigger-on-move))
-                         'move))))
+                        ((and moved (ecoin--trigger-on-move-p)) 'move))))
     (setq ecoin--last-tick (buffer-chars-modified-tick)
           ecoin--last-point (point))
     (cond

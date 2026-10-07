@@ -22,6 +22,11 @@
 ;; - Server health is a state machine (`ecoin-llama--state'): a failure costs
 ;;   one message and a backoff, not an error per keystroke.
 ;; - At most one completion request is in flight across all buffers.
+;; - An LRU cache of raw answers (also under keys that survive the prefix
+;;   window shifting) serves repeated and typed-through contexts without a
+;;   request.  After a ghost is shown, a speculative request for the context
+;;   after accepting it fills the cache; it shares the single flight, so a
+;;   user request waits for it.  Background requests need a recent trigger.
 
 ;;; Code:
 
@@ -118,6 +123,24 @@ Manual requests ignore it."
   "Completions asked for by `ecoin-complete', limited by the server's slots."
   :type 'integer)
 
+(defcustom ecoin-llama-cache-size 250
+  "Number of contexts whose raw completions are kept, least recently used out."
+  :type 'integer)
+
+(defcustom ecoin-llama-prefetch t
+  "Non-nil: after a ghost is shown, request the next one as if it were accepted.
+The answer only fills the cache."
+  :type 'boolean)
+
+(defcustom ecoin-llama-prefetch-t-max-predict-ms 500
+  "Generation time budget of a speculative prefetch request.
+Lower than for a user request because a prefetch holds the single flight."
+  :type 'integer)
+
+(defcustom ecoin-llama-activity-window 30
+  "Seconds after the last trigger during which background requests are sent."
+  :type 'number)
+
 (defcustom ecoin-llama-warn-non-loopback t
   "Non-nil: warn once per session when the URL host is not loopback."
   :type 'boolean)
@@ -148,16 +171,23 @@ Manual requests ignore it."
 (defvar ecoin-llama--queued nil "The newest job waiting for the one in flight.")
 (defvar ecoin-llama--retry-timer nil "Timer that starts the queued job.")
 (defvar ecoin-llama--last-timings nil "Server timings of the last completion.")
+(defvar ecoin-llama--last-activity nil
+  "`float-time' of the last user trigger; background requests need it recent.")
+(defvar ecoin-llama--prefetch-timer nil "Timer that sends the pending prefetch.")
 
 (cl-defstruct (ecoin-llama--job (:constructor ecoin-llama--make-job))
   "A request from the core.  A nil CALLBACK means it was cancelled."
-  buffer point tick callback ctx manual target conn done waking)
+  buffer point tick callback ctx manual target conn done waking
+  prefetch                              ; fills the cache only
+  waited)                               ; queued behind another request
 
 (defun ecoin-llama--reset (&optional keep-warned)
   "Forget the server state, backoff and requests; keep the warning if KEEP-WARNED."
   (when ecoin-llama--inflight (ecoin-llama--abort ecoin-llama--inflight))
   (when ecoin-llama--queued (setf (ecoin-llama--job-done ecoin-llama--queued) t))
   (when ecoin-llama--retry-timer (cancel-timer ecoin-llama--retry-timer))
+  (when ecoin-llama--prefetch-timer (cancel-timer ecoin-llama--prefetch-timer))
+  (ecoin-llama--cache-clear)
   (setq ecoin-llama--state 'unknown
         ecoin-llama--props nil
         ecoin-llama--last-ok nil
@@ -172,6 +202,8 @@ Manual requests ignore it."
         ecoin-llama--inflight nil
         ecoin-llama--queued nil
         ecoin-llama--retry-timer nil
+        ecoin-llama--prefetch-timer nil
+        ecoin-llama--last-activity nil
         ecoin-llama--last-timings nil)
   (unless keep-warned (setq ecoin-llama--warned-loopback nil))
   (force-mode-line-update t))
@@ -545,12 +577,16 @@ once, unless the returned connection is cancelled."
 (defun ecoin-llama--submit (job)
   "Start JOB now, or queue it behind the request in flight."
   (when-let* ((cur ecoin-llama--inflight))
-    (when (ecoin-llama--far-p cur job) (ecoin-llama--abort cur)))
+    ;; A prefetch is never cancelled by a trigger; the trigger waits for it.
+    (when (and (not (ecoin-llama--job-prefetch cur))
+               (ecoin-llama--far-p cur job))
+      (ecoin-llama--abort cur)))
   (when ecoin-llama--queued
     (setf (ecoin-llama--job-done ecoin-llama--queued) t
           ecoin-llama--queued nil))
   (if ecoin-llama--inflight
-      (progn (setq ecoin-llama--queued job)
+      (progn (setf (ecoin-llama--job-waited job) t)
+             (setq ecoin-llama--queued job)
              (ecoin-llama--arm-retry))
     (ecoin-llama--start job)))
 
@@ -563,8 +599,16 @@ once, unless the returned connection is cancelled."
 (defun ecoin-llama--start (job)
   "Serve JOB: probe the server if needed, then send the completion."
   (cond
-   ((or (ecoin-llama--job-done job) (null (ecoin-llama--job-callback job)))
+   ((or (ecoin-llama--job-done job)
+        (and (null (ecoin-llama--job-callback job))
+             (not (ecoin-llama--job-prefetch job))))
     (setf (ecoin-llama--job-done job) t))
+   ((and (ecoin-llama--job-prefetch job) (not (ecoin-llama--background-ok-p)))
+    (setf (ecoin-llama--job-done job) t))
+   ;; What it waited for may have answered it (a prefetch usually does).
+   ((and (ecoin-llama--job-waited job) (not (ecoin-llama--job-manual job))
+         (ecoin-llama--serve-from-cache job))
+    (ecoin-llama--finish job))
    ;; A job that waited out a failure must not probe before the backoff ends.
    ((and (not (ecoin-llama--job-manual job)) (ecoin-llama--in-backoff-p))
     (setf (ecoin-llama--job-done job) t))
@@ -626,7 +670,8 @@ once, unless the returned connection is cancelled."
                  (setq ecoin-llama--props props)
                  (ecoin-llama--set-state
                   (if (plist-get props :is_sleeping) 'sleeping 'ready)))
-               (if (ecoin-llama--job-callback job)
+               (if (or (ecoin-llama--job-callback job)
+                       (ecoin-llama--job-prefetch job))
                    (funcall next job)
                  (ecoin-llama--finish job)))))))))
 
@@ -657,7 +702,10 @@ once, unless the returned connection is cancelled."
                       :input_extra []
                       :n_predict ecoin-llama-n-predict
                       :n_indent (plist-get ctx :n-indent)
-                      :t_max_predict_ms ecoin-llama-t-max-predict-ms
+                      :t_max_predict_ms
+                      (if (ecoin-llama--job-prefetch job)
+                          ecoin-llama-prefetch-t-max-predict-ms
+                        ecoin-llama-t-max-predict-ms)
                       :stream :false
                       :cache_prompt t
                       :response_fields ecoin-llama--response-fields)
@@ -704,7 +752,8 @@ once, unless the returned connection is cancelled."
 (defun ecoin-llama--after-timeout (job)
   "The server answered /props after JOB's request timed out."
   (if (and (eq ecoin-llama--state 'sleeping)
-           (not (ecoin-llama--job-waking job)))
+           (not (ecoin-llama--job-waking job))
+           (not (ecoin-llama--job-prefetch job)))
       (ecoin-llama--send job)
     (when (eq ecoin-llama--state 'sleeping)
       (ecoin-llama--set-state
@@ -728,6 +777,15 @@ once, unless the returned connection is cancelled."
                 :predicted_ms (plist-get body :timings/predicted_ms)
                 :cache_n (plist-get body :timings/cache_n)))
     (ecoin--log "infill: %s" ecoin-llama--last-timings)
+    ;; Whatever happened to the context meanwhile, the answer is still good.
+    ;; A blank answer to a guess must not become a zero-request "no ghost"
+    ;; hit when the user really gets there.
+    (ecoin-llama--cache-store
+     (ecoin-llama--job-ctx job)
+     (if (ecoin-llama--job-prefetch job)
+         (seq-filter (lambda (c) (string-match-p "[^ \t\n]" c))
+                     (ecoin-llama--contents body))
+       (ecoin-llama--contents body)))
     (when (and callback (buffer-live-p buffer))
       (with-current-buffer buffer
         (when (and (= (point) (ecoin-llama--job-point job))
@@ -756,8 +814,10 @@ once, unless the returned connection is cancelled."
     (let ((nl (cl-position ?\n (substring text 0 max) :from-end t)))
       (if nl (substring text 0 (1+ nl)) ""))))
 
-(defun ecoin-llama--context ()
+(defun ecoin-llama--context (&optional insertion)
   "Return the /infill context around point as a plist.
+With INSERTION, a string, build it as if INSERTION were inserted at point and
+point were after it; the buffer is not changed.
 Keys: :prefix :middle :suffix :n-indent :text-before :text-after."
   (save-restriction
     (widen)
@@ -766,13 +826,22 @@ Keys: :prefix :middle :suffix :n-indent :text-before :text-after."
              (pt (point))
              (bol (progn (forward-line 0) (point)))
              (eol (line-end-position))
-             (line (buffer-substring-no-properties bol eol))
-             (text-before (buffer-substring-no-properties bol pt))
+             (head (concat (buffer-substring-no-properties bol pt) insertion))
+             ;; Complete lines of the insertion join the lines above; the
+             ;; last one is the line point is on.
+             (parts (split-string head "\n"))
+             (text-before (car (last parts)))
+             (extra (last (butlast parts) ecoin-llama-n-prefix))
              (text-after (buffer-substring-no-properties pt eol))
+             (line (concat text-before text-after))
              (blank (string-match-p "\\`[ \t]*\\'" line))
-             (above (buffer-substring-no-properties
-                     (progn (forward-line (- ecoin-llama-n-prefix)) (point))
-                     bol))
+             (above (concat
+                     (buffer-substring-no-properties
+                      (progn (forward-line (- (max 0 (- ecoin-llama-n-prefix
+                                                        (length extra)))))
+                             (point))
+                      bol)
+                     (mapconcat (lambda (l) (concat l "\n")) extra "")))
              (below (buffer-substring-no-properties
                      (progn (goto-char eol) (forward-line 1) (point))
                      (progn (forward-line ecoin-llama-n-suffix) (point)))))
@@ -923,14 +992,191 @@ line, since the core's dedent step on delivery removes it."
             (push (ecoin-make-item :text text :backend 'llama) items)))))
     (nreverse items)))
 
+;;;; Cache
+
+(defconst ecoin-llama--cache-separator "\x1e"
+  "Between the text before point and the suffix in a cache key.")
+(defconst ecoin-llama--cache-max-contents 3
+  "Raw completions kept per key.")
+(defconst ecoin-llama--cache-shifted-keys 3
+  "Keys stored per answer with the first 1..N prefix lines dropped.")
+(defconst ecoin-llama--typed-back-max 128
+  "Characters before point the typed-through lookup looks back over.")
+
+(defvar ecoin-llama--cache (make-hash-table :test #'equal)
+  "Key (sha256 of a context) to a list of raw /infill contents, newest first.")
+(defvar ecoin-llama--cache-order nil
+  "Cache keys, most recently used first.")
+
+(defun ecoin-llama--cache-clear ()
+  "Forget every cached completion."
+  (clrhash ecoin-llama--cache)
+  (setq ecoin-llama--cache-order nil))
+
+(defun ecoin-llama--cache-key (before suffix)
+  "Key of the text BEFORE point (prefix and middle) with SUFFIX after it."
+  (secure-hash 'sha256 (encode-coding-string
+                        (concat before ecoin-llama--cache-separator suffix)
+                        'utf-8 t)))
+
+(defun ecoin-llama--cache-touch (key)
+  "Make KEY the most recently used."
+  (setq ecoin-llama--cache-order
+        (cons key (delete key ecoin-llama--cache-order))))
+
+(defun ecoin-llama--cache-put (key contents)
+  "Add CONTENTS, raw strings, under KEY and evict the least recently used."
+  (puthash key (seq-take (seq-uniq (append contents (gethash key ecoin-llama--cache)))
+                         ecoin-llama--cache-max-contents)
+           ecoin-llama--cache)
+  (ecoin-llama--cache-touch key)
+  (while (> (length ecoin-llama--cache-order) (max 1 ecoin-llama-cache-size))
+    (remhash (car (last ecoin-llama--cache-order)) ecoin-llama--cache)
+    (setq ecoin-llama--cache-order (butlast ecoin-llama--cache-order))))
+
+(defun ecoin-llama--cache-store (ctx contents)
+  "Cache the raw CONTENTS answering the context CTX.
+Also store them under the keys with the first 1..3 prefix lines dropped, so
+a hit survives the prefix window shifting after a newline."
+  (let ((prefix (plist-get ctx :prefix))
+        (middle (plist-get ctx :middle))
+        (suffix (plist-get ctx :suffix))
+        (n 0))
+    (when contents
+      (while prefix
+        (ecoin-llama--cache-put
+         (ecoin-llama--cache-key (concat prefix middle) suffix) contents)
+        (let ((nl (and (< n ecoin-llama--cache-shifted-keys)
+                       (string-search "\n" prefix))))
+          (setq prefix (and nl (substring prefix (1+ nl)))
+                n (1+ n)))))))
+
+(defun ecoin-llama--cache-has-p (ctx)
+  "Non-nil if the exact context CTX is cached."
+  (gethash (ecoin-llama--cache-key (concat (plist-get ctx :prefix)
+                                           (plist-get ctx :middle))
+                                   (plist-get ctx :suffix))
+           ecoin-llama--cache))
+
+(defun ecoin-llama--cache-typed-through (before suffix)
+  "Items for text BEFORE point (prefix and middle) from an older shorter context.
+Return the post-processed items of the longest cached remainder that is
+still a ghost, or nil.  The chars typed since are removed from the front."
+  (let ((n (length before)) (candidates nil))
+    (cl-loop for i from 1 to (min ecoin-llama--typed-back-max n)
+             for key = (ecoin-llama--cache-key (substring before 0 (- n i))
+                                               suffix)
+             for hit = (gethash key ecoin-llama--cache)
+             for typed = (and hit (substring before (- n i)))
+             do (dolist (c hit)
+                  (when (and (string-prefix-p typed c) (> (length c) i))
+                    (push (cons (substring c i) key) candidates))))
+    (setq candidates (sort candidates (lambda (a b) (> (length (car a))
+                                                       (length (car b))))))
+    (cl-loop for (rest . key) in candidates
+             for items = (ecoin-llama--items (list rest))
+             when items do (ecoin-llama--cache-touch key) and return items)))
+
+(defun ecoin-llama--cache-lookup (ctx)
+  "Look up the context CTX at point.  Return (ITEMS) on a hit, else nil.
+Exact key first, then typed-through reuse."
+  (let* ((before (concat (plist-get ctx :prefix) (plist-get ctx :middle)))
+         (suffix (plist-get ctx :suffix))
+         (key (ecoin-llama--cache-key before suffix)))
+    (if-let* ((hit (gethash key ecoin-llama--cache)))
+        (progn (ecoin-llama--cache-touch key)
+               (list (ecoin-llama--items hit)))
+      (when (> (hash-table-count ecoin-llama--cache) 0)
+        (when-let* ((items (ecoin-llama--cache-typed-through before suffix)))
+          (list items))))))
+
+(defun ecoin-llama--call-with-items (callback items)
+  "Call CALLBACK with ITEMS; log instead of signalling."
+  (condition-case err
+      (funcall callback items)
+    (error (ecoin--log "deliver: %s" (car err)))))
+
+(defun ecoin-llama--serve-from-cache (job)
+  "Answer JOB from the cache if its buffer is unchanged; non-nil if it did."
+  (let ((buffer (ecoin-llama--job-buffer job)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (and (= (point) (ecoin-llama--job-point job))
+                   (= (buffer-chars-modified-tick) (ecoin-llama--job-tick job)))
+          (when-let* ((hit (ecoin-llama--cache-lookup (ecoin-llama--job-ctx job))))
+            (ecoin-llama--call-with-items (ecoin-llama--job-callback job)
+                                          (car hit))
+            t))))))
+
+;;;; Background requests
+
+(defun ecoin-llama--note-activity ()
+  "Record a user trigger."
+  (setq ecoin-llama--last-activity (float-time)))
+
+(defun ecoin-llama--background-ok-p ()
+  "Non-nil if a request nobody asked for may be sent now.
+The server must be ready, and the user must have triggered recently."
+  (and (eq ecoin-llama--state 'ready)
+       (not (ecoin-llama--in-backoff-p))
+       ecoin-llama--last-activity
+       (< (- (float-time) ecoin-llama--last-activity)
+          ecoin-llama-activity-window)))
+
+(defun ecoin-llama--prefetch-fire (buffer ctx)
+  "Send the prefetch for CTX if BUFFER still shows the ghost it was made for.
+Typing into the ghost keeps CTX valid; anything else makes it useless, and
+it would only hold the single flight."
+  (setq ecoin-llama--prefetch-timer nil)
+  (when (and (buffer-live-p buffer)
+             (not ecoin-llama--inflight)
+             (not ecoin-llama--queued)
+             (ecoin-llama--background-ok-p)
+             (not (ecoin-llama--cache-has-p ctx)))
+    (with-current-buffer buffer
+      (when (and (ecoin--visible-p)
+                 (equal ctx (ecoin-llama--context (ecoin--overlay-ghost))))
+        (when-let* ((target (condition-case nil (ecoin-llama--target)
+                              (user-error nil))))
+          (ecoin-llama--start
+           (ecoin-llama--make-job :buffer buffer :point (point)
+                                  :tick (buffer-chars-modified-tick)
+                                  :ctx ctx :target target :prefetch t)))))))
+
+(defun ecoin-llama--note-shown (item)
+  "A ghost for ITEM is displayed: cache what accepting its first line leaves.
+If prefetching is on, also schedule the request for the context after
+accepting all of it."
+  (let ((ghost (ecoin-item-text item)))
+    (when (and (null (ecoin-item-end item))
+               (> (length ghost) 0)
+               (string-match "\\`\n*[^\n]*" ghost))
+      (let ((line (match-string 0 ghost))
+            (rest (substring ghost (match-end 0))))
+        (when (> (length rest) 0)
+          (ecoin-llama--cache-store (ecoin-llama--context line) (list rest))))
+      (when (and ecoin-llama-prefetch
+                 (ecoin-llama--background-ok-p)
+                 (string-match-p ecoin-llama-line-suffix-regexp
+                                 (buffer-substring-no-properties
+                                  (point) (line-end-position))))
+        (let ((ctx (ecoin-llama--context ghost)))
+          (unless (ecoin-llama--cache-has-p ctx)
+            (when ecoin-llama--prefetch-timer
+              (cancel-timer ecoin-llama--prefetch-timer))
+            ;; Not now: the hook runs inside the delivery of the request
+            ;; that is still counted as in flight.
+            (setq ecoin-llama--prefetch-timer
+                  (run-with-timer 0 nil #'ecoin-llama--prefetch-fire
+                                  (current-buffer) ctx))))))))
+
 ;;;; Backend methods
 
-(defun ecoin-llama--auto-ok-p ()
-  "Non-nil if an automatic request may be made at point."
-  (and (not (ecoin-llama--in-backoff-p))
-       (string-match-p ecoin-llama-line-suffix-regexp
-                       (buffer-substring-no-properties
-                        (point) (line-end-position)))))
+(defun ecoin-llama--line-suffix-ok-p ()
+  "Non-nil if the text after point allows an automatic request."
+  (string-match-p ecoin-llama-line-suffix-regexp
+                  (buffer-substring-no-properties
+                   (point) (line-end-position))))
 
 (defun ecoin-llama--target-or-nil (manual)
   "Return the target; on a config error signal if MANUAL, else report once."
@@ -943,20 +1189,32 @@ line, since the core's dedent step on delivery removes it."
        nil))))
 
 (cl-defmethod ecoin-backend-request ((_backend (eql 'llama)) request callback)
-  "Ask the server for completions for REQUEST; CALLBACK gets the items."
+  "Ask the server for completions for REQUEST; CALLBACK gets the items.
+An automatic request is answered from the cache when it can be, at once."
+  (ecoin-llama--note-activity)
   (let* ((manual (eq (ecoin-request-trigger request) 'manual))
-         (target (ecoin-llama--target-or-nil manual)))
-    (when (and target (or manual (ecoin-llama--auto-ok-p)))
-      (let ((job (ecoin-llama--make-job
-                  :buffer (ecoin-request-buffer request)
-                  :point (ecoin-request-point request)
-                  :tick (ecoin-request-tick request)
-                  :callback callback
-                  :ctx (ecoin-llama--context)
-                  :manual manual
-                  :target target)))
-        (ecoin-llama--submit job)
-        job))))
+         (ctx (and (or manual (ecoin-llama--line-suffix-ok-p))
+                   (ecoin-llama--context))))
+    (when ctx
+      (if-let* ((hit (and (not manual) (ecoin-llama--cache-lookup ctx))))
+          (ecoin-llama--call-with-items callback (car hit))
+        ;; Resolving the target first: a changed key or URL ends a backoff.
+        (let ((target (ecoin-llama--target-or-nil manual)))
+          (when (and target (or manual (not (ecoin-llama--in-backoff-p))))
+            (let ((job (ecoin-llama--make-job
+                        :buffer (ecoin-request-buffer request)
+                        :point (ecoin-request-point request)
+                        :tick (ecoin-request-tick request)
+                        :callback callback
+                        :ctx ctx
+                        :manual manual
+                        :target target)))
+              (ecoin-llama--submit job)
+              job)))))))
+
+(cl-defmethod ecoin-backend-shown ((_backend (eql 'llama)) item)
+  "Prepare the cache for what the user does with the ghost of ITEM."
+  (ecoin-llama--note-shown item))
 
 (cl-defmethod ecoin-backend-cancel ((_backend (eql 'llama)) job)
   "Detach JOB from its callback.

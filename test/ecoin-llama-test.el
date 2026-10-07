@@ -167,6 +167,7 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
           (ecoin-llama-api-key nil)
           (ecoin-llama-request-timeout 2)
           (ecoin-llama-retry-delay 0.01)
+          (ecoin-llama-prefetch nil)
           (orig-http (symbol-function 'ecoin-llama--http)))
      (ecoin-llama--reset)
      (unwind-protect
@@ -1154,6 +1155,490 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
    (let ((ecoin-llama-url "http://127.0.0.1:1"))
      (should (ecoin-backend-available-p 'llama))
      (should-not ecoin-llama--config-failed))))
+
+;;;; Cache, typed-through reuse, prefetch
+
+(defun ecoin-llama-test--answer (fn)
+  "Handler: a healthy /props; /infill gets the answer FN gives for its body.
+FN returns a content string or a full reply plist."
+  (lambda (r)
+    (if (equal (plist-get r :path) ecoin-llama--path-props)
+        (list :body ecoin-llama-test--props)
+      (let ((spec (funcall fn (ecoin-llama-test--request-json r))))
+        (if (stringp spec) (list :body (list :content spec)) spec)))))
+
+(defun ecoin-llama-test--infills ()
+  "Number of /infill requests the server has seen."
+  (ecoin-llama-test--count ecoin-llama--path-infill))
+
+(defun ecoin-llama-test--show (&optional trigger)
+  "Request at point and wait for the ghost; return it."
+  (ecoin--request (or trigger 'auto))
+  (should (ecoin-llama-test--wait #'ecoin-llama-test--ghost))
+  (ecoin-llama-test--ghost))
+
+(ert-deftest ecoin-llama-test-cache-exact-hit-sends-nothing ()
+  (ecoin-llama-test--with-server (ecoin-llama-test--answer (lambda (_) "foo()"))
+    (ecoin-llama-test--in-buffer "x = "
+      (should (equal "foo()" (ecoin-llama-test--show)))
+      (ecoin-dismiss)
+      (ecoin--request 'auto)
+      ;; Synchronous: no waiting for the event loop.
+      (should (equal "foo()" (ecoin-llama-test--ghost)))
+      (should (= 1 (ecoin-llama-test--infills))))))
+
+(ert-deftest ecoin-llama-test-cache-typed-through-returns-the-remainder ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer (lambda (_) "foo(bar, baz)"))
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin-llama-test--show)
+      (ecoin-dismiss)
+      (insert "foo(b")
+      (ecoin--request 'auto)
+      (should (equal "ar, baz)" (ecoin-llama-test--ghost)))
+      (should (= 1 (ecoin-llama-test--infills)))
+      ;; Typing something else is a miss.
+      (ecoin-dismiss)
+      (insert "q")
+      (ecoin--request 'auto)
+      (ecoin-llama-test--settle 0.1)
+      (should (= 2 (ecoin-llama-test--infills))))))
+
+(ert-deftest ecoin-llama-test-cache-typed-through-longest-remainder-wins ()
+  (let ((buffer-text "x = "))
+    (ecoin-llama-test--with-server (ecoin-llama-test--answer (lambda (_) ""))
+      (ecoin-llama-test--in-buffer buffer-text
+        (let ((ctx (ecoin-llama--context)))
+          (ecoin-llama--cache-store ctx '("abcdef")))
+        (insert "a")
+        (let ((ctx (ecoin-llama--context)))
+          (ecoin-llama--cache-store ctx '("bcdefghij")))
+        (insert "bc")
+        (ecoin--request 'auto)
+        ;; From "x = a": "bcdefghij" minus "bc"; from "x = ": "abcdef" minus
+        ;; "abc".
+        (should (equal "defghij" (ecoin-llama-test--ghost)))
+        (should-not ecoin-llama-test--requests)))))
+
+(ert-deftest ecoin-llama-test-cache-shifted-prefix-keys-hit-after-a-newline ()
+  (let ((ecoin-llama-n-prefix 3))
+    (ecoin-llama-test--with-server
+        (ecoin-llama-test--answer (lambda (_) "foo\nbar"))
+      (ecoin-llama-test--in-buffer "l1\nl2\nl3\nl4\nx = "
+        (ecoin-llama-test--show)
+        (ecoin-dismiss)
+        ;; The newline moves the 3-line prefix window down by a line, so the
+        ;; old context only matches through its key without the first line.
+        (insert "foo\n")
+        (ecoin--request 'auto)
+        (should (equal "bar" (ecoin-llama-test--ghost)))
+        (should (= 1 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-cache-stores-the-shifted-keys ()
+  (let ((ctx '(:prefix "a\nb\nc\nd\ne\n" :middle "m" :suffix "\n")))
+    (ecoin-llama--reset)
+    (ecoin-llama--cache-store ctx '("x"))
+    (should (= 4 (hash-table-count ecoin-llama--cache)))
+    (dolist (prefix '("a\nb\nc\nd\ne\n" "b\nc\nd\ne\n" "c\nd\ne\n" "d\ne\n"))
+      (should (ecoin-llama--cache-has-p
+               (list :prefix prefix :middle "m" :suffix "\n"))))
+    (should-not (ecoin-llama--cache-has-p
+                 '(:prefix "e\n" :middle "m" :suffix "\n")))
+    (ecoin-llama--reset)))
+
+(ert-deftest ecoin-llama-test-cache-keeps-three-deduplicated-contents ()
+  (ecoin-llama--reset)
+  (let ((ctx '(:prefix "" :middle "m" :suffix "\n")))
+    (ecoin-llama--cache-store ctx '("a" "b" "a"))
+    (ecoin-llama--cache-store ctx '("c" "d"))
+    (let ((key (ecoin-llama--cache-key "m" "\n")))
+      (should (equal '("c" "d" "a") (gethash key ecoin-llama--cache))))
+    ;; An empty answer is an answer: asking again would give the same.
+    (ecoin-llama--cache-store '(:prefix "" :middle "n" :suffix "\n") '(""))
+    (should (= 2 (hash-table-count ecoin-llama--cache)))
+    (ecoin-llama--cache-store '(:prefix "" :middle "o" :suffix "\n") nil)
+    (should (= 2 (hash-table-count ecoin-llama--cache))))
+  (ecoin-llama--reset))
+
+(ert-deftest ecoin-llama-test-cache-lru-evicts-the-oldest ()
+  (let ((ecoin-llama-cache-size 2))
+    (ecoin-llama--reset)
+    (cl-flet ((ctx (m) (list :prefix "" :middle m :suffix "\n")))
+      (ecoin-llama--cache-store (ctx "a") '("1"))
+      (ecoin-llama--cache-store (ctx "b") '("2"))
+      ;; A lookup makes "a" the most recently used.
+      (with-temp-buffer
+        (insert "a")
+        (should (ecoin-llama--cache-lookup (ecoin-llama--context))))
+      (ecoin-llama--cache-store (ctx "c") '("3"))
+      (should (ecoin-llama--cache-has-p (ctx "a")))
+      (should-not (ecoin-llama--cache-has-p (ctx "b")))
+      (should (ecoin-llama--cache-has-p (ctx "c")))
+      (should (= 2 (hash-table-count ecoin-llama--cache)))
+      (should (= 2 (length ecoin-llama--cache-order))))
+    (ecoin-llama--reset)))
+
+(ert-deftest ecoin-llama-test-cache-stale-responses-are-cached ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer (lambda (_) '(:delay 0.2 :body (:content "late"))))
+    (ecoin-llama-test--in-buffer "foo("
+      (ecoin--request 'auto)
+      (should (ecoin-llama-test--wait (lambda () ecoin-llama-test--requests)))
+      ;; The user moves on before the answer comes.
+      (insert "x")
+      (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+      (should-not (ecoin-llama-test--ghost))
+      (delete-char -1)
+      (ecoin--request 'auto)
+      (should (equal "late" (ecoin-llama-test--ghost)))
+      (should (= 1 (ecoin-llama-test--infills))))))
+
+(ert-deftest ecoin-llama-test-cache-detached-responses-are-cached ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer (lambda (_) '(:delay 0.2 :body (:content "late"))))
+    (ecoin-llama-test--in-buffer "foo("
+      (ecoin--request 'auto)
+      (should (ecoin-llama-test--wait (lambda () ecoin-llama-test--requests)))
+      (ecoin--cancel-pending)
+      (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+      (should-not (ecoin-llama-test--ghost))
+      (ecoin--request 'auto)
+      (should (equal "late" (ecoin-llama-test--ghost)))
+      (should (= 1 (ecoin-llama-test--infills))))))
+
+(ert-deftest ecoin-llama-test-cache-manual-bypasses-it ()
+  (let ((n 0))
+    (ecoin-llama-test--with-server
+        (ecoin-llama-test--answer (lambda (_) (format "r%d" (cl-incf n))))
+      (ecoin-llama-test--in-buffer "x = "
+        (should (equal "r1" (ecoin-llama-test--show)))
+        (ecoin-dismiss)
+        (should (equal "r2" (ecoin-llama-test--show 'manual)))
+        (should (= 2 (ecoin-llama-test--infills)))
+        ;; The manual answer is cached for the next automatic request.
+        (ecoin-dismiss)
+        (ecoin--request 'auto)
+        (should (equal "r2" (ecoin-llama-test--ghost)))
+        (should (= 2 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-cache-hit-works-while-the-server-is-down ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer (lambda (_) "foo()"))
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin-llama-test--show)
+      (ecoin-dismiss)
+      (ecoin-llama--set-state 'down "down")
+      (ecoin--request 'auto)
+      (should (equal "foo()" (ecoin-llama-test--ghost))))))
+
+(defconst ecoin-llama-test--prefetch-ms 500
+  "The `t_max_predict_ms' a prefetch request must carry.")
+
+(defun ecoin-llama-test--prefetch-answer (user-content prefetch-content
+                                                        &optional delay)
+  "Handler answering USER-CONTENT to user requests, PREFETCH-CONTENT to prefetches.
+The prefetch answer comes DELAY seconds late."
+  (ecoin-llama-test--answer
+   (lambda (body)
+     (if (equal (plist-get body :t_max_predict_ms) ecoin-llama-test--prefetch-ms)
+         (list :delay (or delay 0) :body (list :content prefetch-content))
+       user-content))))
+
+(ert-deftest ecoin-llama-test-prefetch-sends-the-as-if-accepted-request-once ()
+  (let ((ecoin-llama-prefetch t))
+    (ecoin-llama-test--with-server
+        (ecoin-llama-test--prefetch-answer "foo()\nbar()" "next")
+      (let ((ecoin-llama-prefetch t))
+        (ecoin-llama-test--in-buffer "x = "
+          (should (equal "foo()\nbar()" (ecoin-llama-test--show)))
+          (should (ecoin-llama-test--wait
+                   (lambda () (= 2 (ecoin-llama-test--infills)))))
+          (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight)))
+          (ecoin-llama-test--settle 0.1)
+          (should (= 2 (ecoin-llama-test--infills)))
+          (let ((body (ecoin-llama-test--request-json
+                       (car (last ecoin-llama-test--requests)))))
+            (should (equal "x = foo()\n" (plist-get body :input_prefix)))
+            (should (equal "bar()" (plist-get body :prompt)))
+            (should (equal "\n" (plist-get body :input_suffix)))
+            (should (= ecoin-llama-test--prefetch-ms
+                       (plist-get body :t_max_predict_ms))))
+          ;; The prefetch fills the cache and is never displayed itself.
+          (should (equal "foo()\nbar()" (ecoin-llama-test--ghost))))))))
+
+(ert-deftest ecoin-llama-test-prefetch-serves-the-next-ghost-after-accept ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--prefetch-answer "foo()\nbar()" "next")
+    (let ((ecoin-llama-prefetch t))
+      (ecoin-llama-test--in-buffer "x = "
+        (ecoin-llama-test--show)
+        (should (ecoin-llama-test--wait
+                 (lambda () (and (= 2 (ecoin-llama-test--infills))
+                                 (null ecoin-llama--inflight)))))
+        (ecoin-accept)
+        (should (equal "x = foo()\nbar()" (buffer-string)))
+        ;; No manual request: accepting asks for the next ghost itself.
+        (should (equal "next" (ecoin-llama-test--ghost)))
+        ;; Nothing was sent for it; the next prefetch comes after.
+        (should (= 2 (ecoin-llama-test--infills)))
+        (should (ecoin-llama-test--wait
+                 (lambda () (= 3 (ecoin-llama-test--infills)))))))))
+
+(ert-deftest ecoin-llama-test-blank-answers-cached-for-user-requests-only ()
+  ;; A blank prefetch answer is dropped: reaching that context later asks.
+  (let ((n 0))
+    (ecoin-llama-test--with-server
+        (ecoin-llama-test--answer
+         (lambda (body)
+           (if (equal (plist-get body :t_max_predict_ms)
+                      ecoin-llama-test--prefetch-ms)
+               "\n"
+             (if (= 1 (cl-incf n)) "foo()" "later"))))
+      (let ((ecoin-llama-prefetch t))
+        (ecoin-llama-test--in-buffer "x = "
+          (ecoin-llama-test--show)
+          (should (ecoin-llama-test--wait
+                   (lambda () (and (= 2 (ecoin-llama-test--infills))
+                                   (null ecoin-llama--inflight)))))
+          (should-not (ecoin-llama--cache-has-p
+                       (ecoin-llama--context "foo()")))
+          (ecoin-accept)
+          ;; Not a zero-request empty hit: the accept's request goes out.
+          (should (ecoin-llama-test--wait
+                   (lambda () (equal "later" (ecoin-llama-test--ghost)))))
+          (should (>= (ecoin-llama-test--infills) 3))))))
+  ;; A blank answer to a user request is cached.
+  (ecoin-llama-test--with-server (ecoin-llama-test--answer (lambda (_) "\n"))
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin--request 'auto)
+      (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+      (should (ecoin-llama--cache-has-p (ecoin-llama--context)))
+      (ecoin--request 'auto)
+      (should (= 1 (ecoin-llama-test--infills))))))
+
+(ert-deftest ecoin-llama-test-prefetch-is-off-when-the-option-is-nil ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--prefetch-answer "foo()" "next")
+    (let ((ecoin-llama-prefetch nil))
+      (ecoin-llama-test--in-buffer "x = "
+        (ecoin-llama-test--show)
+        (ecoin-llama-test--settle)
+        (should (= 1 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-accept-line-entry-serves-the-remaining-lines ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer (lambda (_) "a()\nb()\nc()"))
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin-llama-test--show)
+      (ecoin-accept-line)
+      (should (equal "x = a()" (buffer-string)))
+      (ecoin-dismiss)
+      (ecoin--request 'auto)
+      (should (equal "\nb()\nc()" (ecoin-llama-test--ghost)))
+      (should (= 1 (ecoin-llama-test--infills)))
+      (ecoin-accept)
+      (should (equal "x = a()\nb()\nc()" (buffer-string))))))
+
+(defun ecoin-llama-test--display-and-note (text)
+  "Display TEXT as the ghost at point, as the core does, and tell the backend."
+  (let ((item (ecoin-make-item :text text :backend 'llama)))
+    (ecoin--display item)
+    (ecoin-backend-shown 'llama item)))
+
+(defun ecoin-llama-test--type (char)
+  "Type CHAR as the self-insert command does, running the core's hook."
+  (setq this-command 'self-insert-command)
+  (insert char)
+  (ecoin--post-command))
+
+(ert-deftest ecoin-llama-test-prefetch-follows-typing-into-the-ghost ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--prefetch-answer "foo()\nbar()" "next")
+    (let ((ecoin-llama-prefetch t))
+      (ecoin-llama-test--in-buffer "x = "
+        (ecoin-llama-test--show)
+        ;; Before the prefetch is sent: the as-if-accepted context is the same.
+        (ecoin-llama-test--type ?f)
+        (ecoin-llama-test--type ?o)
+        (should (equal "o()\nbar()" (ecoin-llama-test--ghost)))
+        (should (ecoin-llama-test--wait
+                 (lambda () (= 2 (ecoin-llama-test--infills)))))
+        (let ((body (ecoin-llama-test--request-json
+                     (car (last ecoin-llama-test--requests)))))
+          (should (equal "x = foo()\n" (plist-get body :input_prefix)))
+          (should (equal "bar()" (plist-get body :prompt))))))))
+
+(ert-deftest ecoin-llama-test-prefetch-is-dropped-when-the-ghost-goes-away ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--prefetch-answer "foo()" "next")
+    (let ((ecoin-llama-prefetch t))
+      (ecoin-llama-test--in-buffer "x = "
+        (ecoin-llama-test--prime-ready)
+        (ecoin-llama--note-activity)
+        (ecoin-llama-test--display-and-note "foo()")
+        (ecoin-dismiss)
+        (ecoin-llama-test--settle 0.3)
+        (should (= 0 (ecoin-llama-test--infills)))))))
+
+(defun ecoin-llama-test--prefetch-sent-p (setup)
+  "Show a ghost after SETUP, a function; return the /infill requests sent.
+The server answers every request; nothing but a prefetch can follow SETUP."
+  (let ((count nil))
+    (ecoin-llama-test--with-server
+        (ecoin-llama-test--answer (lambda (_) "next"))
+      (let ((ecoin-llama-prefetch t))
+        (ecoin-llama-test--in-buffer "x = "
+          (ecoin-llama-test--prime-ready)
+          (ecoin-llama--note-activity)
+          (funcall setup)
+          (ecoin-llama-test--display-and-note "foo()")
+          (ecoin-llama-test--settle 0.4)
+          (setq count (ecoin-llama-test--infills)))))
+    count))
+
+(ert-deftest ecoin-llama-test-prefetch-gating ()
+  (should (= 1 (ecoin-llama-test--prefetch-sent-p #'ignore)))
+  ;; Sleeping and failure states.
+  (should (= 0 (ecoin-llama-test--prefetch-sent-p
+                (lambda () (ecoin-llama--set-state 'sleeping)))))
+  (dolist (state '(down error loading unsupported unauthorized))
+    (should (= 0 (ecoin-llama-test--prefetch-sent-p
+                  (lambda () (ecoin-llama--set-state state "failed"))))))
+  ;; Outside the activity window.
+  (should (= 0 (ecoin-llama-test--prefetch-sent-p
+                (lambda () (setq ecoin-llama--last-activity
+                                 (- (float-time)
+                                    ecoin-llama-activity-window 1))))))
+  (should (= 0 (ecoin-llama-test--prefetch-sent-p
+                (lambda () (setq ecoin-llama--last-activity nil)))))
+  ;; Switched off.
+  (should (= 0 (ecoin-llama-test--prefetch-sent-p
+                (lambda () (setq ecoin-llama-prefetch nil))))))
+
+(ert-deftest ecoin-llama-test-prefetch-not-sent-while-a-request-is-in-flight ()
+  (ecoin-llama-test--with-server (lambda (_r) '(:hang t))
+    (let ((ecoin-llama-prefetch t))
+      (ecoin-llama-test--in-buffer "x = "
+        (ecoin-llama-test--prime-ready)
+        (ecoin--request 'auto)
+        (should (ecoin-llama-test--wait (lambda () ecoin-llama-test--requests)))
+        (ecoin-llama-test--display-and-note "foo()")
+        (ecoin-llama-test--settle 0.3)
+        (should (= 1 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-user-trigger-waits-for-a-prefetch-and-hits-the-cache ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--prefetch-answer "foo()" "next" 0.3)
+    (let ((ecoin-llama-prefetch t))
+      (ecoin-llama-test--in-buffer "x = "
+        (ecoin-llama-test--show)
+        (should (ecoin-llama-test--wait
+                 (lambda () (= 2 (ecoin-llama-test--infills)))))
+        (should ecoin-llama--inflight)
+        (ecoin-accept)
+        (ecoin--request 'auto)
+        ;; Queued behind the prefetch, which is not cancelled.
+        (should ecoin-llama--queued)
+        (should-not (ecoin-llama-test--ghost))
+        (should (ecoin-llama-test--wait #'ecoin-llama-test--ghost))
+        (should (equal "next" (ecoin-llama-test--ghost)))
+        (should (= 0 ecoin-llama-test--closed))
+        (should (= 2 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-user-trigger-waits-for-a-prefetch-then-sends-on-a-miss ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--prefetch-answer "foo()" "next" 0.3)
+    (let ((ecoin-llama-prefetch t))
+      (ecoin-llama-test--in-buffer "x = "
+        (ecoin-llama-test--show)
+        (should (ecoin-llama-test--wait
+                 (lambda () (= 2 (ecoin-llama-test--infills)))))
+        (ecoin-accept)
+        (insert "q")
+        (ecoin--request 'auto)
+        (should ecoin-llama--queued)
+        (ecoin-llama-test--settle 0.1)
+        (should (= 2 (ecoin-llama-test--infills)))
+        ;; Not "next": the typed "q" is not what the prefetch assumed.
+        (should (ecoin-llama-test--wait
+                 (lambda () (= 3 (ecoin-llama-test--infills)))))
+        (should (ecoin-llama-test--wait #'ecoin-llama-test--ghost))
+        (should (= 0 ecoin-llama-test--closed))))))
+
+(ert-deftest ecoin-llama-test-a-far-trigger-does-not-cancel-a-prefetch ()
+  (let ((ecoin-llama-n-suffix 1))
+    (ecoin-llama-test--with-server
+        (ecoin-llama-test--prefetch-answer "foo()" "next" 0.3)
+      (let ((ecoin-llama-prefetch t))
+        (ecoin-llama-test--in-buffer (concat (make-string 1 ?x) "(\n\n\n\n\nz(")
+          (goto-char (point-min))
+          (end-of-line)
+          (ecoin-llama-test--show)
+          (should (ecoin-llama-test--wait
+                   (lambda () (= 2 (ecoin-llama-test--infills)))))
+          (goto-char (point-max))
+          (ecoin--request 'auto)
+          (ecoin-llama-test--settle 0.1)
+          (should (= 0 ecoin-llama-test--closed))
+          (should ecoin-llama--queued))))))
+
+(ert-deftest ecoin-llama-test-background-needs-recent-activity ()
+  (ecoin-llama-test--prime-ready)
+  (setq ecoin-llama--last-activity nil)
+  (should-not (ecoin-llama--background-ok-p))
+  (ecoin-llama--note-activity)
+  (should (ecoin-llama--background-ok-p))
+  (let ((ecoin-llama-activity-window 0))
+    (should-not (ecoin-llama--background-ok-p)))
+  (ecoin-llama--reset))
+
+(ert-deftest ecoin-llama-test-requests-note-the-activity ()
+  (ecoin-llama-test--with-server (ecoin-llama-test--answer (lambda (_) "foo()"))
+    (ecoin-llama-test--in-buffer "x = "
+      (should-not ecoin-llama--last-activity)
+      (ecoin-llama-test--show)
+      (should ecoin-llama--last-activity))))
+
+;;;; Virtual insertion context
+
+(defconst ecoin-llama-test--insertion-cases
+  '(("a\nb\nc\nd\n    foo(|" "x,\n    y)\nz")
+    ("a\nb\nc\nd\nx = |" "\nfoo\n\nbar")
+    ("a\nb\nc\nd\n    |" "return 1\n    pass")
+    ("one|" "")
+    ("a\nb\nc|)\nd\ne\n" "foo(\n  1,\n  2")
+    ("|" "x\ny\nz\n")
+    ("a\nb|\nc\n" "\n\n\n\n\n"))
+  "(BUFFER INSERTION) pairs; \"|\" in BUFFER marks point.")
+
+(ert-deftest ecoin-llama-test-virtual-context-with-an-empty-insertion ()
+  (dolist (case ecoin-llama-test--insertion-cases)
+    (dolist (n '(0 1 2 256))
+      (let ((ecoin-llama-n-prefix n) (ecoin-llama-n-suffix (max 1 (min n 3))))
+        (ecoin-llama-test--context (car case)
+          (should (equal ctx (ecoin-llama--context "")))
+          (should (equal ctx (ecoin-llama--context nil))))))))
+
+(ert-deftest ecoin-llama-test-virtual-context-equals-the-real-one-after-inserting ()
+  (dolist (case ecoin-llama-test--insertion-cases)
+    (dolist (n '(0 1 2 3 256))
+      (dolist (prefix-chars '(9 12000))
+        (let ((ecoin-llama-n-prefix n)
+              (ecoin-llama-n-suffix (max 1 (min n 2)))
+              (ecoin-llama-max-prefix-chars prefix-chars)
+              (ecoin-llama-max-suffix-chars 40))
+          (ecoin-llama-test--context (car case)
+            (let ((virtual (ecoin-llama--context (cadr case))))
+              (insert (cadr case))
+              (should (equal (ecoin-llama--context) virtual)))))))))
+
+(ert-deftest ecoin-llama-test-virtual-context-leaves-the-buffer-alone ()
+  (ecoin-llama-test--context "a\nb|\nc"
+    (let ((tick (buffer-modified-tick)) (pt (point)))
+      (ecoin-llama--context "x\ny")
+      (should (= tick (buffer-modified-tick)))
+      (should (= pt (point)))
+      (should (equal "a\nb\nc" (buffer-string))))))
 
 (provide 'ecoin-llama-test)
 ;;; ecoin-llama-test.el ends here
