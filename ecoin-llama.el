@@ -1185,11 +1185,11 @@ accepting all of it."
 (cl-defmethod ecoin-backend-request ((_backend (eql 'llama)) request callback)
   "Ask the server for completions for REQUEST; CALLBACK gets the items.
 An automatic request is answered from the cache when it can be, at once."
+  (ecoin-llama--note-activity)
   (let* ((manual (eq (ecoin-request-trigger request) 'manual))
          (ctx (and (or manual (ecoin-llama--line-suffix-ok-p))
                    (ecoin-llama--context))))
     (when ctx
-      (ecoin-llama--note-activity)
       (if-let* ((hit (and (not manual) (ecoin-llama--cache-lookup ctx))))
           (ecoin-llama--call-with-items callback (car hit))
         ;; Resolving the target first: a changed key or URL ends a backoff.
