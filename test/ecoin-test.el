@@ -301,5 +301,324 @@
     (should-not (featurep 'ecoin-copilot))
     (should-not (featurep 'jsonrpc))))
 
+;;;; Frontend: evil, popups, exclusions
+
+;; Neither evil nor corfu is installed in CI; these are only declared so the
+;; tests can bind them.
+(defvar evil-local-mode)
+(defvar evil-insert-state-exit-hook)
+(defvar corfu--frame)
+(defvar company-candidates)
+(defvar multiple-cursors-mode)
+(defvar so-long-minor-mode)
+
+(defun ecoin-test--show (content ghost &optional pos)
+  "In the current buffer insert CONTENT, go to POS (default end), show GHOST."
+  (insert content)
+  (goto-char (or pos (point-max)))
+  (setq ecoin-test--items (list (ecoin-test--item ghost)))
+  (ecoin--request 'manual))
+
+(defun ecoin-test--after-string-cursor ()
+  "The `cursor' property on char 0 of the ghost's after-string."
+  (get-text-property 0 'cursor (overlay-get ecoin--overlay 'after-string)))
+
+(ert-deftest ecoin-test-insert-state-p-without-evil ()
+  (with-temp-buffer
+    (should (ecoin-insert-state-p))))
+
+(ert-deftest ecoin-test-insert-state-p-follows-the-evil-state ()
+  (with-temp-buffer
+    (let ((evil-local-mode t) (insert nil) (emacs nil))
+      (cl-letf (((symbol-function 'evil-insert-state-p) (lambda () insert))
+                ((symbol-function 'evil-emacs-state-p) (lambda () emacs)))
+        (should-not (ecoin-insert-state-p))
+        (setq emacs t)
+        (should (ecoin-insert-state-p))
+        (setq emacs nil insert t)
+        (should (ecoin-insert-state-p))))))
+
+(ert-deftest ecoin-test-no-automatic-request-outside-insert-state ()
+  (ecoin-test--with-buffer "foo"
+    (let ((evil-local-mode t))
+      (cl-letf (((symbol-function 'evil-insert-state-p) (lambda () nil))
+                ((symbol-function 'evil-emacs-state-p) (lambda () nil)))
+        (should-not (ecoin--allowed-p))))))
+
+(ert-deftest ecoin-test-reply-after-leaving-insert-state-is-dropped ()
+  (ecoin-test--with-buffer "foo"
+    (setq ecoin-test--defer t)
+    (ecoin--request 'auto)
+    (let ((evil-local-mode t))
+      (cl-letf (((symbol-function 'evil-insert-state-p) (lambda () nil))
+                ((symbol-function 'evil-emacs-state-p) (lambda () nil)))
+        (funcall (car ecoin-test--callbacks) (list (ecoin-test--item "x")))))
+    (should-not (ecoin-test--ghost))))
+
+(ert-deftest ecoin-test-evil-insert-exit-hook-hides-the-ghost ()
+  (let ((evil-insert-state-exit-hook nil))
+    (ecoin-test--with-buffer ""
+      (ecoin-test--show "foo" "bar")
+      (should (ecoin-test--ghost))
+      (should (memq #'ecoin--hide (buffer-local-value 'evil-insert-state-exit-hook
+                                                      (current-buffer))))
+      (run-hooks 'evil-insert-state-exit-hook)
+      (should-not (ecoin-test--ghost)))))
+
+(ert-deftest ecoin-test-overlay-has-the-keymap-window-and-priority ()
+  (ecoin-test--with-buffer ""
+    (let ((ecoin-overlay-priority 77))
+      (ecoin-test--show "foo" "bar"))
+    (should (eq ecoin-completion-map (get-pos-property (point) 'keymap)))
+    (should (eq (selected-window) (overlay-get ecoin--overlay 'window)))
+    (should (= 77 (overlay-get ecoin--overlay 'priority)))
+    (should (= 101 (overlay-get ecoin--keymap-overlay 'priority)))
+    (should (eq 'ecoin-accept (lookup-key ecoin-completion-map (kbd "TAB"))))
+    (should-not (memq 'ecoin--emulation-alist emulation-mode-map-alists))))
+
+(ert-deftest ecoin-test-keymap-overlay-is-zero-length-at-the-end-of-the-buffer ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "bar")
+    (should (= 0 (- (overlay-end ecoin--keymap-overlay)
+                    (overlay-start ecoin--keymap-overlay))))
+    (ecoin-test--show "" "baz" 2)
+    (should (= 1 (- (overlay-end ecoin--keymap-overlay)
+                    (overlay-start ecoin--keymap-overlay))))))
+
+(ert-deftest ecoin-test-clearing-removes-both-overlays ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "bar")
+    (ecoin-dismiss)
+    (should (null (overlays-in (point-min) (1+ (point-max)))))
+    (should-not ecoin--overlay-active)))
+
+(ert-deftest ecoin-test-cursor-property-is-t-at-eol-and-1-mid-line ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "bar")
+    (should (eq t (ecoin-test--after-string-cursor)))
+    (ecoin-test--show "" "baz" 2)
+    (should (eql 1 (ecoin-test--after-string-cursor)))))
+
+(ert-deftest ecoin-test-no-display-property-is-used ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "bar" 2)
+    (should-not (overlay-get ecoin--overlay 'display))
+    (should (= (overlay-start ecoin--overlay) (overlay-end ecoin--overlay)))
+    (should (equal "foo" (buffer-string)))))
+
+(ert-deftest ecoin-test-leading-newline-gets-a-space-for-the-cursor ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "def f():" "\n    return 1")
+    (let ((str (overlay-get ecoin--overlay 'after-string)))
+      (should (equal " \n    return 1" (substring-no-properties str)))
+      (should (eq t (get-text-property 0 'cursor str))))
+    (should (equal "\n    return 1" (ecoin-test--ghost)))))
+
+(ert-deftest ecoin-test-pre-command-hides-the-ghost-for-motion ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "bar")
+    (let ((this-command 'next-line) (this-original-command 'next-line))
+      (ecoin--pre-command))
+    (should-not (ecoin-test--ghost))))
+
+(ert-deftest ecoin-test-pre-command-keeps-the-ghost-for-typing-ecoin-and-prefix-commands ()
+  (dolist (cmd '(self-insert-command ecoin-accept ecoin-next ecoin-complete
+                 universal-argument digit-argument negative-argument
+                 universal-argument-more))
+    (ecoin-test--with-buffer ""
+      (ecoin-test--show "foo" "bar")
+      (let ((this-command cmd) (this-original-command cmd))
+        (ecoin--pre-command))
+      (should (ecoin-test--ghost)))))
+
+(ert-deftest ecoin-test-prefix-command-keeps-the-ghost-in-post-command ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "bar")
+    (let ((this-command 'universal-argument-more)
+          (this-original-command 'universal-argument))
+      (ecoin--post-command))
+    (should (ecoin-test--ghost))
+    (let ((this-command 'next-line) (this-original-command 'next-line))
+      (ecoin--post-command))
+    (should-not (ecoin-test--ghost))))
+
+(ert-deftest ecoin-test-typing-the-last-ghost-char-accepts-it ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "fo" "ob")
+    (let ((item (overlay-get ecoin--overlay 'ecoin-item))
+          (this-command 'self-insert-command))
+      (insert "o")
+      (should (ecoin--typed-into-ghost))
+      (should (equal "b" (ecoin-test--ghost)))
+      (insert "b")
+      (should (ecoin--typed-into-ghost))
+      (should-not (ecoin-test--ghost))
+      (should (= 1 (length ecoin-test--accepted)))
+      (should (equal '("b" nil) (cdar ecoin-test--accepted)))
+      (should (eq 'ecoin-test-stub (ecoin-item-backend (caar ecoin-test--accepted))))
+      (should (eq 'ecoin-test-stub (ecoin-item-backend item))))
+    (should-not ecoin--timer)))
+
+(ert-deftest ecoin-test-trigger-on-move-needs-the-capability ()
+  (dolist (cap '(nil t))
+    (cl-letf (((symbol-function 'ecoin-backend-capabilities)
+               (lambda (_backend) (and cap '(:trigger-on-move t)))))
+      (ecoin-test--with-buffer "foo bar"
+        (ecoin--post-command)
+        (goto-char 2)
+        (ecoin--post-command)
+        (should (eq (and cap t) (and ecoin--timer t)))
+        (ecoin--cancel-timer)))))
+
+(ert-deftest ecoin-test-an-edit-schedules-a-request-without-the-capability ()
+  (ecoin-test--with-buffer "foo"
+    (insert "d")
+    (ecoin--post-command)
+    (should ecoin--timer)
+    (ecoin--cancel-timer)))
+
+(ert-deftest ecoin-test-exclusion-regexps ()
+  (dolist (file '("/p/.env" "/p/.env.local" "/home/u/.authinfo" "/home/u/.authinfo.gpg"
+                  "/home/u/.netrc" "/p/a.gpg" "/p/a.age" "/p/cert.pem" "/p/server.key"
+                  "/home/u/.ssh/config" "/home/u/id_rsa" "/home/u/id_ed25519.pub"
+                  "/home/u/.aws/credentials" "/home/u/.gnupg/gpg.conf"
+                  "/home/u/.password-store/a.txt" "/p/secrets.yml" "/p/secrets.yaml"
+                  "/p/secrets.json" "/p/secrets.env"))
+    (with-temp-buffer
+      (setq buffer-file-name file)
+      (should (ecoin--excluded-p))))
+  (dolist (file '("/p/main.py" "/p/environment.el" "/p/env.el" "/p/keymap.el"
+                  "/p/monkey.el" "/p/secrets.md" "/p/netrc.el" "/p/foo.agent"))
+    (with-temp-buffer
+      (setq buffer-file-name file)
+      (should-not (ecoin--excluded-p))))
+  (with-temp-buffer
+    (should-not (ecoin--excluded-p))))
+
+(ert-deftest ecoin-test-exclude-functions ()
+  (with-temp-buffer
+    (let ((ecoin-exclude-functions (list (lambda () t))))
+      (should (ecoin--excluded-p)))
+    (let ((ecoin-exclude-functions (list (lambda () (error "boom")))))
+      (should (ecoin--excluded-p)))))
+
+(ert-deftest ecoin-test-excluded-buffer-never-requests ()
+  (ecoin-test--with-buffer "foo"
+    (setq buffer-file-name "/p/.env")
+    (unwind-protect
+        (progn
+          (should-not (ecoin--allowed-p))
+          (setq ecoin-test--items (list (ecoin-test--item "bar")))
+          (let (msg)
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+              (ecoin-complete))
+            (should (string-match-p "excluded" msg)))
+          (should-not (ecoin-test--ghost))
+          (should-not ecoin-test--shown))
+      (setq buffer-file-name nil))))
+
+(ert-deftest ecoin-test-completion-in-region-gates-requests-and-hides-the-ghost ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "bar")
+    (should (ecoin--allowed-p))
+    (setq-local completion-in-region-mode t)
+    (unwind-protect
+        (progn
+          (should-not (ecoin--allowed-p))
+          (let ((this-command 'self-insert-command))
+            (ecoin--post-command))
+          (should-not (ecoin-test--ghost))
+          (should-not ecoin--timer))
+      (kill-local-variable 'completion-in-region-mode))))
+
+(ert-deftest ecoin-test-corfu-frame-gates-only-while-visible ()
+  (ecoin-test--with-buffer "foo"
+    (let ((corfu--frame 'frame))
+      (cl-letf (((symbol-function 'frame-live-p) (lambda (f) (eq f 'frame)))
+                ((symbol-function 'frame-visible-p) (lambda (_f) nil)))
+        (should (ecoin--allowed-p)))
+      (cl-letf (((symbol-function 'frame-live-p) (lambda (f) (eq f 'frame)))
+                ((symbol-function 'frame-visible-p) (lambda (_f) t)))
+        (should-not (ecoin--allowed-p))))))
+
+(ert-deftest ecoin-test-other-quiet-situations ()
+  (ecoin-test--with-buffer "foo"
+    (should (ecoin--allowed-p))
+    (let ((executing-kbd-macro t)) (should-not (ecoin--allowed-p)))
+    (let ((company-candidates '("a"))) (should-not (ecoin--allowed-p)))
+    (let ((multiple-cursors-mode t)) (should-not (ecoin--allowed-p)))
+    (let ((so-long-minor-mode t)) (should-not (ecoin--allowed-p)))
+    (cl-letf (((symbol-function 'invisible-p) (lambda (_p) t)))
+      (should-not (ecoin--allowed-p)))
+    (cl-letf (((symbol-function 'evil-mc-has-cursors-p) (lambda () t)))
+      (should-not (ecoin--allowed-p)))))
+
+(ert-deftest ecoin-test-disable-predicates-still-work ()
+  (ecoin-test--with-buffer "foo"
+    (let ((ecoin-disable-predicates (list (lambda () t))))
+      (should-not (ecoin--allowed-p)))))
+
+(ert-deftest ecoin-test-accept-drops-indentation-already-before-point ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "def f():\n    " "    return 1")
+    (ecoin-accept)
+    (should (equal "def f():\n    return 1" (buffer-string)))
+    (should (equal "return 1" (cadar ecoin-test--accepted)))))
+
+(ert-deftest ecoin-test-accept-keeps-extra-indentation ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "if x:\n    " "        y")
+    (ecoin-accept)
+    (should (equal "if x:\n        y" (buffer-string)))))
+
+(ert-deftest ecoin-test-accept-does-not-dedent-after-text ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "  bar")
+    (ecoin-accept)
+    (should (equal "foo  bar" (buffer-string)))))
+
+(ert-deftest ecoin-test-accept-word-dedents-and-keeps-the-remainder ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "    " "    return 1")
+    (ecoin-accept-word)
+    (should (equal "    return" (buffer-string)))
+    (should (equal " 1" (ecoin-test--ghost)))))
+
+;; Dedent happens on delivery, so the ghost is what accepting inserts.
+(ert-deftest ecoin-test-delivered-text-is-dedented-only-in-indentation ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "def f():\n    " "    return x")
+    (should (equal "return x" (ecoin-test--ghost))))
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "  bar")
+    (should (equal "  bar" (ecoin-test--ghost)))))
+
+(ert-deftest ecoin-test-displayed-ghost-equals-the-accepted-insertion ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "def f():\n    " "    return x")
+    (let ((shown (substring-no-properties
+                  (overlay-get ecoin--overlay 'after-string))))
+      (ecoin-accept)
+      (should (equal shown (cadar ecoin-test--accepted)))
+      (should (equal "def f():\n    return x" (buffer-string))))))
+
+(ert-deftest ecoin-test-item-that-is-only-duplicated-indentation-is-dropped ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "if x:\n    " "    ")
+    (should-not (ecoin-test--ghost))
+    (should-not ecoin-test--shown)))
+
+(ert-deftest ecoin-test-log-keeps-buffer-text-out-unless-asked ()
+  (cl-letf (((symbol-function 'ecoin-backend-accepted)
+             (lambda (&rest _) (signal 'args-out-of-range '("secret buffer text" 1)))))
+    (dolist (case '((nil . nil) (t . t)))
+      (when (get-buffer "*ecoin-log*") (kill-buffer "*ecoin-log*"))
+      (let ((ecoin-log-content (car case)))
+        (ecoin--hook #'ecoin-backend-accepted 'ecoin-test-stub nil "x" nil))
+      (with-current-buffer "*ecoin-log*"
+        (should (eq (cdr case) (and (string-match-p "secret buffer text" (buffer-string)) t)))
+        (should (string-match-p "args-out-of-range\\|Args out of range" (buffer-string)))))))
+
 (provide 'ecoin-test)
 ;;; ecoin-test.el ends here
