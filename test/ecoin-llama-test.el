@@ -261,14 +261,14 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
     (should-not (ecoin-llama--api-key))))
 
 (ert-deftest ecoin-llama-test-key-lookup-ignores-default-directory ()
-  (let ((default-directory "/ssh:nohost:/home/")
+  ;; A remote `default-directory' would make every request stat a remote host.
+  (let ((default-directory "/ecoin-llama-test-nowhere/")
         (ecoin-llama-api-key "sk-literal")
         (seen nil))
     (cl-letf (((symbol-function 'file-readable-p)
                (lambda (f) (push f seen) nil)))
       (should (equal "sk-literal" (ecoin-llama--api-key))))
-    (should seen)
-    (should-not (cl-some (lambda (f) (string-match-p "nohost" f)) seen))))
+    (should (equal (list (expand-file-name "sk-literal" "~/")) seen))))
 
 (ert-deftest ecoin-llama-test-bad-keys-are-user-errors ()
   (dolist (key '("kéy" "ke\ny" "ke\r\ny" "\U0001F600"))
