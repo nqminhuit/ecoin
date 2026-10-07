@@ -324,7 +324,7 @@ TRIGGER is `auto' or `manual'."
                          (unless (ecoin-item-backend item)
                            (setf (ecoin-item-backend item) backend))
                          (> (length (ecoin-item-text item)) 0))
-                       items)))))))
+                       (mapcar #'ecoin--dedent-item items))))))))
 
 (defun ecoin--handle-items (items)
   (if (null items)
@@ -412,6 +412,16 @@ Typing the last char accepts the item."
 
 ;;;; Accepting
 
+(defun ecoin--dedent-item (item)
+  "Return ITEM, or a copy without the indentation already before point.
+Done on delivery so that the ghost shows exactly what accepting inserts."
+  (let ((text (ecoin-item-text item)))
+    (if (equal text (ecoin--dedent text))
+        item
+      (let ((copy (copy-ecoin-item item)))
+        (setf (ecoin-item-text copy) (ecoin--dedent text))
+        copy))))
+
 (defun ecoin--dedent (text)
   "Drop from TEXT the indentation already before point, if point is in indentation.
 Models often repeat the indentation of the current line at the start of
@@ -432,17 +442,16 @@ their suggestion."
          (ghost (ecoin-item-text item))
          (end (marker-position (overlay-get ov 'ecoin-end)))
          (text (if transform (funcall transform ghost) ghost))
-         (partial (< (length text) (length ghost)))
-         (insertion (ecoin--dedent text)))
+         (partial (< (length text) (length ghost))))
     (ecoin--clear-overlay)
     (if partial
         (progn
-          (insert insertion)
-          (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item insertion t)
-          (ecoin--display (ecoin--remainder item (length text) (+ end (length insertion)))))
+          (insert text)
+          (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item text t)
+          (ecoin--display (ecoin--remainder item (length text) (+ end (length text)))))
       (delete-region (point) (max (point) end))
-      (insert insertion)
-      (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item insertion nil))))
+      (insert text)
+      (ecoin--hook #'ecoin-backend-accepted (ecoin-item-backend item) item text nil))))
 
 (defun ecoin-accept ()
   "Accept the whole suggestion."

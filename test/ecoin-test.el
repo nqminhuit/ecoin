@@ -585,6 +585,30 @@
     (should (equal "    return" (buffer-string)))
     (should (equal " 1" (ecoin-test--ghost)))))
 
+;; Dedent happens on delivery, so the ghost is what accepting inserts.
+(ert-deftest ecoin-test-delivered-text-is-dedented-only-in-indentation ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "def f():\n    " "    return x")
+    (should (equal "return x" (ecoin-test--ghost))))
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "foo" "  bar")
+    (should (equal "  bar" (ecoin-test--ghost)))))
+
+(ert-deftest ecoin-test-displayed-ghost-equals-the-accepted-insertion ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "def f():\n    " "    return x")
+    (let ((shown (substring-no-properties
+                  (overlay-get ecoin--overlay 'after-string))))
+      (ecoin-accept)
+      (should (equal shown (cadar ecoin-test--accepted)))
+      (should (equal "def f():\n    return x" (buffer-string))))))
+
+(ert-deftest ecoin-test-item-that-is-only-duplicated-indentation-is-dropped ()
+  (ecoin-test--with-buffer ""
+    (ecoin-test--show "if x:\n    " "    ")
+    (should-not (ecoin-test--ghost))
+    (should-not ecoin-test--shown)))
+
 (ert-deftest ecoin-test-log-keeps-buffer-text-out-unless-asked ()
   (cl-letf (((symbol-function 'ecoin-backend-accepted)
              (lambda (&rest _) (signal 'args-out-of-range '("secret buffer text" 1)))))
