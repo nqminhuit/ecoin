@@ -1640,5 +1640,923 @@ The server answers every request; nothing but a prefetch can follow SETUP."
       (should (= pt (point)))
       (should (equal "a\nb\nc" (buffer-string))))))
 
+;;;; Extra-context ring
+
+(defun ecoin-llama-test--code (tag n)
+  "N lines of code whose tokens are unique to TAG."
+  (mapconcat (lambda (i) (format "v_%s_%d = f_%s_%d" tag i tag i))
+             (number-sequence 1 n) "\n"))
+
+(defun ecoin-llama-test--chunk (tag &optional lines)
+  "A ring chunk of LINES (default 5) lines from the file TAG.py."
+  (list :filename (format "%s.py" tag)
+        :text (concat (ecoin-llama-test--code tag (or lines 5)) "\n")
+        :time 0.0))
+
+(defun ecoin-llama-test--put (ring &rest chunks)
+  "Put CHUNKS straight into RING's chunks, newest last."
+  (setf (ecoin-llama--ring-chunks ring)
+        (append (ecoin-llama--ring-chunks ring) chunks))
+  (cl-incf (ecoin-llama--ring-version ring)))
+
+(defmacro ecoin-llama-test--with-dir (var &rest body)
+  "Run BODY with VAR a temp directory, without project detection."
+  (declare (indent 1))
+  `(let* ((,var (file-name-as-directory (make-temp-file "ecoin-ring" t)))
+          (ecoin-backend 'llama)
+          (make-backup-files nil)
+          (ecoin-llama-ring-chunks 16))
+     (unwind-protect
+         (cl-letf (((symbol-function 'ecoin-llama--project-root) #'ignore))
+           ,@body)
+       (dolist (b (buffer-list))
+         (when (and (buffer-file-name b)
+                    (string-prefix-p ,var (expand-file-name (buffer-file-name b))))
+           (with-current-buffer b
+             (set-buffer-modified-p nil)
+             (ecoin-mode -1))
+           (kill-buffer b)))
+       (delete-directory ,var t))))
+
+(defun ecoin-llama-test--file (dir name content)
+  "Visit DIR/NAME holding CONTENT with `ecoin-mode' on; return the buffer."
+  (let ((file (expand-file-name name dir)))
+    (make-directory (file-name-directory file) t)
+    (with-temp-file file (insert content))
+    (let ((buffer (find-file-noselect file)))
+      (with-current-buffer buffer (ecoin-mode 1))
+      buffer)))
+
+(defun ecoin-llama-test--queue (buffer)
+  "The queued chunks of the ring of BUFFER's project."
+  (with-current-buffer buffer
+    (when-let* ((ring (ecoin-llama--current-ring)))
+      (ecoin-llama--ring-queue ring))))
+
+(ert-deftest ecoin-llama-test-dice-values ()
+  (let ((near (lambda (a b) (< (abs (- a b)) 1e-9))))
+    (should (funcall near 1.0 (ecoin-llama--similarity "a b c" "c b a")))
+    (should (funcall near 0.0 (ecoin-llama--similarity "a b" "c d")))
+    (should (funcall near (/ 2.0 3) (ecoin-llama--similarity "a b c" "a b d")))
+    (should (funcall near 0.8 (ecoin-llama--similarity "a b c d e" "a b c d x")))
+    (should (funcall near 1.0 (ecoin-llama--similarity "" "!! ??")))
+    (should (funcall near 0.0 (ecoin-llama--similarity "a" "")))
+    ;; The set variant: duplicates do not push it above 1 (llama.vim: 1.5).
+    (should (funcall near 1.0 (ecoin-llama--similarity "a" "a a a")))
+    ;; An underscore is part of a token, whatever the syntax table says.
+    (should (funcall near 1.0 (ecoin-llama--similarity "foo_bar" "foo_bar")))
+    (should (funcall near 0.0 (ecoin-llama--similarity "foo_bar" "foo bar")))
+    (with-temp-buffer
+      (emacs-lisp-mode)
+      (should (funcall near 0.0 (ecoin-llama--similarity "foo_bar" "foo bar"))))))
+
+(ert-deftest ecoin-llama-test-pick-evicts-above-0.9-and-keeps-0.9 ()
+  (let ((ring (ecoin-llama--make-ring))
+        (tokens (lambda (n &optional skip)
+                  (concat (mapconcat (lambda (i) (format "t%d" i))
+                                     (number-sequence 1 n) " ")
+                          skip "\n"))))
+    (let ((a (list :filename "a" :text (funcall tokens 20)))
+          (b (list :filename "b" :text (funcall tokens 19))))
+      ;; 19 of 20 tokens shared: 2*19/39 > 0.9.
+      (should (ecoin-llama--enqueue ring a t))
+      (should (ecoin-llama--enqueue ring b t))
+      (should (equal (list b) (ecoin-llama--ring-queue ring))))
+    ;; A far pick is skipped instead.
+    (setf (ecoin-llama--ring-queue ring) nil)
+    (let ((a (list :filename "a" :text (funcall tokens 20)))
+          (b (list :filename "b" :text (funcall tokens 19))))
+      (ecoin-llama--enqueue ring a t)
+      (should-not (ecoin-llama--enqueue ring b nil))
+      (should (equal (list a) (ecoin-llama--ring-queue ring))))
+    ;; Exactly 0.9 (9 of 10 tokens) is not above it.
+    (setf (ecoin-llama--ring-queue ring) nil)
+    (let ((a (list :filename "a" :text (funcall tokens 10)))
+          (b (list :filename "b" :text (funcall tokens 9 " other"))))
+      (ecoin-llama--enqueue ring a t)
+      (should (ecoin-llama--enqueue ring b t))
+      (should (= 2 (length (ecoin-llama--ring-queue ring)))))
+    ;; An identical chunk is never queued twice, even by an evicting pick.
+    (let ((a (car (ecoin-llama--ring-queue ring))))
+      (should-not (ecoin-llama--enqueue ring (copy-sequence a) t))
+      (should (= 2 (length (ecoin-llama--ring-queue ring)))))))
+
+(ert-deftest ecoin-llama-test-pick-evicts-from-the-ring-too ()
+  (let* ((ring (ecoin-llama--make-ring))
+         (text (lambda (n) (concat (mapconcat (lambda (i) (format "t%d" i))
+                                              (number-sequence 1 n) " ")
+                                   "\n")))
+         (old (list :filename "a" :text (funcall text 20))))
+    (ecoin-llama-test--put ring old)
+    (let ((version (ecoin-llama--ring-version ring)))
+      (ecoin-llama--enqueue ring (list :filename "b" :text (funcall text 19)) t)
+      (should-not (ecoin-llama--ring-chunks ring))
+      (should (> (ecoin-llama--ring-version ring) version)))))
+
+(ert-deftest ecoin-llama-test-request-time-eviction-above-0.5 ()
+  (let* ((tokens (lambda (a b) (concat (mapconcat (lambda (i) (format "t%d" i))
+                                                  (number-sequence 1 a) " ")
+                                       " "
+                                       (mapconcat (lambda (i) (format "u%d" i))
+                                                  (number-sequence 1 b) " ")
+                                       "\n")))
+         (half (list :filename "half" :text (funcall tokens 5 5)))   ; 0.5
+         (more (list :filename "more" :text (funcall tokens 6 4)))   ; 0.6
+         (queued (list :filename "queued" :text (funcall tokens 7 3)))
+         (ring (ecoin-llama--make-ring :chunks (list half more)
+                                       :queue (list queued))))
+    (with-temp-buffer
+      (insert "t1 t2 t3 t4 t5 t6 t7 t8 t9 t10\n")
+      (ecoin-llama--evict-local ring (current-buffer))
+      (should (equal (list half) (ecoin-llama--ring-chunks ring)))
+      ;; The queue is left alone at request time.
+      (should (equal (list queued) (ecoin-llama--ring-queue ring)))
+      (ecoin-llama--evict-local ring (current-buffer) t)
+      (should-not (ecoin-llama--ring-queue ring)))))
+
+(ert-deftest ecoin-llama-test-queue-is-capped-and-drops-the-oldest ()
+  (let ((ring (ecoin-llama--make-ring)))
+    (dotimes (i 20)
+      (ecoin-llama--enqueue ring (ecoin-llama-test--chunk (format "c%d" i)) t))
+    (let ((names (mapcar (lambda (c) (plist-get c :filename))
+                         (ecoin-llama--ring-queue ring))))
+      (should (= 16 (length names)))
+      (should (equal "c4.py" (car names)))
+      (should (equal "c19.py" (car (last names)))))))
+
+(ert-deftest ecoin-llama-test-pick-needs-three-lines-and-a-token ()
+  (let ((ring (ecoin-llama--make-ring)))
+    (ecoin-llama--pick ring "a.py" "one\ntwo\n" t)
+    (ecoin-llama--pick ring "a.py" "\n\n\n\n" t)
+    (should-not (ecoin-llama--ring-queue ring))
+    (ecoin-llama--pick ring "a.py" "one\ntwo\nthree\n" t)
+    (should (= 1 (length (ecoin-llama--ring-queue ring))))))
+
+(ert-deftest ecoin-llama-test-serialization-order-cap-and-keys ()
+  (let* ((chunks (mapcar (lambda (i)
+                           (list :filename (format "f%d.py" i)
+                                 :text (concat (make-string 99 ?a) "\n")
+                                 :time 1.0))
+                         (number-sequence 1 5)))
+         (ring (ecoin-llama--make-ring :chunks chunks)))
+    ;; 100 chars each: a cap of 250 keeps the two newest, oldest first.
+    (let ((ecoin-llama-extra-max-chars 250))
+      (let ((extra (car (ecoin-llama--ring-extra ring))))
+        (should (equal ["f4.py" "f5.py"]
+                       (vconcat (mapcar (lambda (o) (plist-get o :filename))
+                                        extra))))
+        ;; Only what the server reads: no :time.
+        (should (equal '(:filename :text)
+                       (cl-loop for (k _) on (aref extra 0) by #'cddr
+                                collect k)))))
+    (let ((ecoin-llama-extra-max-chars 100000))
+      (should (= 5 (length (car (ecoin-llama--ring-extra ring)))))
+      (let ((ecoin-llama-ring-chunks 3))
+        (should (equal ["f3.py" "f4.py" "f5.py"]
+                       (vconcat (mapcar (lambda (o) (plist-get o :filename))
+                                        (car (ecoin-llama--ring-extra ring))))))))
+    ;; The newest chunk alone is over the cap: nothing is sent.
+    (let ((ecoin-llama-extra-max-chars 99))
+      (should (equal [] (car (ecoin-llama--ring-extra ring))))
+      (should-not (cdr (ecoin-llama--ring-extra ring))))
+    ;; Counted in characters of text: 5 x 100.
+    (should (= 500 (ecoin-llama--extra-chars
+                    (car (ecoin-llama--ring-extra ring)))))))
+
+(ert-deftest ecoin-llama-test-extra-id-follows-the-text-not-the-ring ()
+  (let* ((one (ecoin-llama--make-ring
+               :chunks (list (ecoin-llama-test--chunk "a")
+                             (ecoin-llama-test--chunk "b"))))
+         (same (ecoin-llama--make-ring
+                :chunks (list (ecoin-llama-test--chunk "a")
+                              (ecoin-llama-test--chunk "b"))))
+         (other (ecoin-llama--make-ring
+                 :chunks (list (ecoin-llama-test--chunk "b")
+                               (ecoin-llama-test--chunk "a")))))
+    (should (cdr (ecoin-llama--ring-extra one)))
+    (should (equal (cdr (ecoin-llama--ring-extra one))
+                   (cdr (ecoin-llama--ring-extra same))))
+    ;; Order matters to the server's prompt, so it matters to the id.
+    (should-not (equal (cdr (ecoin-llama--ring-extra one))
+                       (cdr (ecoin-llama--ring-extra other))))
+    ;; The cap is part of what is sent, so it is part of the id.
+    (let ((before (cdr (ecoin-llama--ring-extra one))))
+      (let ((ecoin-llama-extra-max-chars 100))
+        (should-not (equal before (cdr (ecoin-llama--ring-extra one))))))
+    (should-not (cdr (ecoin-llama--ring-extra nil)))
+    (should (equal [] (car (ecoin-llama--ring-extra nil))))
+    (should (equal (ecoin-llama--cache-key "a" "b")
+                   (ecoin-llama--cache-key "a" "b" nil)))
+    (should-not (equal (ecoin-llama--cache-key "a" "b")
+                       (ecoin-llama--cache-key "a" "b" "id")))))
+
+(ert-deftest ecoin-llama-test-json-el-fallback-serializes-the-extra ()
+  (let* ((extra (vector (list :filename "src/é.py" :text "x = 1\n")
+                        (list :filename "b.py" :text "y\n")))
+         (body (list :input_prefix "" :input_extra extra :samplers [])))
+    (let ((native (ecoin-llama--encode-body body))
+          (fallback (let ((ecoin-llama--native-json nil))
+                      (ecoin-llama--encode-body body))))
+      (should (equal (ecoin-llama--parse-json (decode-coding-string native 'utf-8))
+                     (ecoin-llama--parse-json
+                      (decode-coding-string fallback 'utf-8)))))))
+
+(ert-deftest ecoin-llama-test-chunks-come-from-saves ()
+  (ecoin-llama-test--with-dir dir
+    (let ((buffer (ecoin-llama-test--file dir "a.py"
+                                          (ecoin-llama-test--code "a" 40))))
+      (with-current-buffer buffer
+        (goto-char (point-min))
+        (forward-line 20)
+        (insert "# edit\n")
+        (save-buffer))
+      (let ((queue (ecoin-llama-test--queue buffer)))
+        (should (= 1 (length queue)))
+        (should (equal "a.py" (plist-get (car queue) :filename)))
+        ;; Sixteen lines above and below the line at point, and itself.
+        (should (= 33 (cl-count ?\n (plist-get (car queue) :text))))
+        (should (string-suffix-p "\n" (plist-get (car queue) :text)))))))
+
+(ert-deftest ecoin-llama-test-chunks-come-from-buffer-switches ()
+  (ecoin-llama-test--with-dir dir
+    (let ((a (ecoin-llama-test--file dir "a.py" (ecoin-llama-test--code "a" 10)))
+          (b (ecoin-llama-test--file dir "b.py" (ecoin-llama-test--code "b" 10))))
+      (ecoin-llama--note-switch a)
+      (ecoin-llama--note-switch b)
+      (should (equal '("a.py" "b.py")
+                     (mapcar (lambda (c) (plist-get c :filename))
+                             (ecoin-llama-test--queue a))))
+      ;; A modified buffer is neither entered nor left into the ring.
+      (with-current-buffer a (insert "# unsaved\n"))
+      (let ((c (ecoin-llama-test--file dir "c.py" (ecoin-llama-test--code "c" 10))))
+        (ecoin-llama--note-switch a)
+        (ecoin-llama--note-switch c)
+        (should (equal '("a.py" "b.py" "c.py")
+                       (mapcar (lambda (ch) (plist-get ch :filename))
+                               (ecoin-llama-test--queue a))))))))
+
+(ert-deftest ecoin-llama-test-a-window-change-is-handled-outside-redisplay ()
+  (ecoin-llama-test--with-dir dir
+    (let ((buffer (ecoin-llama-test--file dir "a.py"
+                                          (ecoin-llama-test--code "a" 10)))
+          (old (window-buffer (selected-window))))
+      (unwind-protect
+          (progn
+            (set-window-buffer (selected-window) buffer)
+            (ecoin-llama--on-window-change (selected-frame))
+            (ecoin-llama--on-window-change (selected-frame))
+            (should ecoin-llama--switch-timer)
+            (should-not (ecoin-llama-test--queue buffer))
+            (should (ecoin-llama-test--wait
+                     (lambda () (null ecoin-llama--switch-timer))))
+            (should (eq buffer ecoin-llama--prev-buffer))
+            (should (= 1 (length (ecoin-llama-test--queue buffer)))))
+        (set-window-buffer (selected-window) old)
+        (ecoin-llama--reset)))))
+
+(ert-deftest ecoin-llama-test-the-minibuffer-is-not-a-switch ()
+  (ecoin-llama-test--with-dir dir
+    (let ((a (ecoin-llama-test--file dir "a.py" (ecoin-llama-test--code "a" 10))))
+      (ecoin-llama--note-switch a)
+      (with-temp-buffer
+        (setq-local minibuffer-completion-table nil)
+        (cl-letf (((symbol-function 'minibufferp) (lambda (&rest _) t)))
+          (ecoin-llama--note-switch (current-buffer))))
+      (should (eq a ecoin-llama--prev-buffer)))))
+
+(ert-deftest ecoin-llama-test-chunks-come-from-copies-and-kills ()
+  (ecoin-llama-test--with-dir dir
+    (let ((buffer (ecoin-llama-test--file dir "a.py"
+                                          (ecoin-llama-test--code "a" 5)))
+          (text (concat (ecoin-llama-test--code "y" 5) "\n")))
+      (with-current-buffer buffer
+        (let ((this-command 'kill-ring-save))
+          (kill-new text)
+          (ecoin-llama--on-command)))
+      (should-not (ecoin-llama-test--queue buffer))
+      (ecoin-llama--poll-kill)
+      (should (equal '("a.py") (mapcar (lambda (c) (plist-get c :filename))
+                                       (ecoin-llama-test--queue buffer))))
+      (should (equal text (plist-get (car (ecoin-llama-test--queue buffer)) :text)))
+      ;; Seen once: polling again does nothing.
+      (ecoin-llama--poll-kill)
+      (should (= 1 (length (ecoin-llama-test--queue buffer))))
+      ;; Under three lines: not worth a chunk.
+      (with-current-buffer buffer
+        (let ((this-command 'kill-region))
+          (kill-new "one\ntwo\n")
+          (ecoin-llama--on-command)))
+      (ecoin-llama--poll-kill)
+      (should (= 1 (length (ecoin-llama-test--queue buffer)))))))
+
+(ert-deftest ecoin-llama-test-a-long-copy-is-cut-to-one-chunk ()
+  (ecoin-llama-test--with-dir dir
+    (let ((buffer (ecoin-llama-test--file dir "a.py" "x\n"))
+          (text (concat (ecoin-llama-test--code "y" 100) "\n")))
+      (cl-letf (((symbol-function 'ecoin-llama--random-offset) (lambda (_) 3)))
+        (with-current-buffer buffer
+          (let ((this-command 'evil-yank))
+            (kill-new text)
+            (ecoin-llama--on-command)))
+        (ecoin-llama--poll-kill))
+      (let ((chunk (car (ecoin-llama-test--queue buffer))))
+        (should (= 32 (cl-count ?\n (plist-get chunk :text))))
+        (should (string-prefix-p "v_y_4 " (plist-get chunk :text)))))))
+
+(ert-deftest ecoin-llama-test-a-copy-is-not-credited-to-the-wrong-buffer ()
+  (ecoin-llama-test--with-dir dir
+    (let ((buffer (ecoin-llama-test--file dir "a.py" "x\n")))
+      (with-current-buffer buffer
+        (let ((this-command 'kill-ring-save))
+          (kill-new (concat (ecoin-llama-test--code "y" 5) "\n"))
+          (ecoin-llama--on-command)))
+      ;; Something else is copied before the ring timer looks.
+      (kill-new (concat (ecoin-llama-test--code "z" 5) "\n"))
+      (ecoin-llama--poll-kill)
+      (should-not (ecoin-llama-test--queue buffer)))))
+
+(ert-deftest ecoin-llama-test-far-picks-use-random-windows-far-from-point ()
+  (ecoin-llama-test--with-dir dir
+    (let* ((ecoin-llama-n-prefix 10)
+           (ecoin-llama-n-suffix 5)
+           (buffer (ecoin-llama-test--file
+                    dir "a.py"
+                    (mapconcat (lambda (i) (format "w%d_a w%d_b" i i))
+                               (number-sequence 1 300) "\n")))
+           (starts nil))
+      (with-current-buffer buffer
+        (let ((ring (ecoin-llama--current-ring t)))
+          (cl-letf (((symbol-function 'ecoin-llama--random-offset)
+                     (lambda (max) (push max starts) 0)))
+            (goto-char (point-min))
+            (forward-line 149)
+            (ecoin-llama--maybe-far-pick ring)
+            ;; Lines 1..140 above (140 - 32 = 108), 155..219 below (65 - 32).
+            (should (equal '(33 108) starts))
+            (let ((queue (ecoin-llama--ring-queue ring)))
+              (should (= 2 (length queue)))
+              (should (string-prefix-p "w1_a " (plist-get (car queue) :text)))
+              (should (string-prefix-p "w155_a " (plist-get (cadr queue) :text)))
+              (should (= 32 (cl-count ?\n (plist-get (car queue) :text)))))
+            ;; Not far enough: no pick.
+            (let ((mark (marker-position (ecoin-llama--ring-far ring))))
+              (forward-line 10)
+              (ecoin-llama--maybe-far-pick ring)
+              (should (= mark (marker-position (ecoin-llama--ring-far ring)))))
+            ;; Exactly 32 lines is not more than 32; 33 is.
+            (goto-char (ecoin-llama--ring-far ring))
+            (forward-line 32)
+            (let ((mark (marker-position (ecoin-llama--ring-far ring))))
+              (ecoin-llama--maybe-far-pick ring)
+              (should (= mark (marker-position (ecoin-llama--ring-far ring)))))
+            (forward-line 1)
+            (ecoin-llama--maybe-far-pick ring)
+            (should (= (point) (marker-position (ecoin-llama--ring-far ring))))))))))
+
+(ert-deftest ecoin-llama-test-a-far-pick-is-skipped-when-similar ()
+  (ecoin-llama-test--with-dir dir
+    (let* ((ecoin-llama-n-prefix 10)
+           (ecoin-llama-n-suffix 5)
+           (lines (mapcar (lambda (i) (format "w%d_a w%d_b" i i))
+                          (number-sequence 1 300)))
+           (buffer (ecoin-llama-test--file dir "a.py"
+                                           (mapconcat #'identity lines "\n"))))
+      (with-current-buffer buffer
+        (let* ((ring (ecoin-llama--current-ring t))
+               ;; Lines 1..32 with one line replaced: far above the cursor.
+               (known (list :filename "a.py"
+                            :text (concat (mapconcat
+                                           #'identity
+                                           (append (seq-take lines 4) '("zz")
+                                                   (seq-subseq lines 5 32))
+                                           "\n")
+                                          "\n"))))
+          (ecoin-llama--enqueue ring known t)
+          (cl-letf (((symbol-function 'ecoin-llama--random-offset)
+                     (lambda (_) 0)))
+            (goto-char (point-min))
+            (forward-line 149)
+            (ecoin-llama--maybe-far-pick ring))
+          (let ((queue (ecoin-llama--ring-queue ring)))
+            (should (= 2 (length queue)))
+            (should (eq known (car queue)))
+            (should (string-prefix-p "w155_a "
+                                     (plist-get (cadr queue) :text)))))))))
+
+(ert-deftest ecoin-llama-test-far-picks-of-a-short-file-need-room ()
+  (ecoin-llama-test--with-dir dir
+    (let ((buffer (ecoin-llama-test--file dir "a.py"
+                                          (ecoin-llama-test--code "a" 20))))
+      (with-current-buffer buffer
+        (let ((ring (ecoin-llama--current-ring t)))
+          (goto-char (point-max))
+          (ecoin-llama--maybe-far-pick ring)
+          (should-not (ecoin-llama--ring-queue ring)))))))
+
+(ert-deftest ecoin-llama-test-chunk-filenames-are-project-relative ()
+  (ecoin-llama-test--with-dir dir
+    (cl-letf (((symbol-function 'ecoin-llama--project-root) (lambda () dir)))
+      (let ((a (ecoin-llama-test--file dir "a.py" (ecoin-llama-test--code "a" 10)))
+            (b (ecoin-llama-test--file dir "sub/dir/b.py"
+                                       (ecoin-llama-test--code "b" 10))))
+        (ecoin-llama--note-switch a)
+        (ecoin-llama--note-switch b)
+        (should (equal '("a.py" "sub/dir/b.py")
+                       (mapcar (lambda (c) (plist-get c :filename))
+                               (ecoin-llama-test--queue b))))))))
+
+(ert-deftest ecoin-llama-test-a-file-outside-the-root-never-contributes ()
+  (ecoin-llama-test--with-dir dir
+    (let ((other (file-name-as-directory (make-temp-file "ecoin-other" t))))
+      (unwind-protect
+          (let ((b (ecoin-llama-test--file other "b.py"
+                                           (ecoin-llama-test--code "b" 10))))
+            (cl-letf (((symbol-function 'ecoin-llama--project-root)
+                       (lambda () dir)))
+              (ecoin-llama--note-switch b)
+              (should-not (ecoin-llama-test--queue b))))
+        (dolist (buf (buffer-list))
+          (when (and (buffer-file-name buf)
+                     (string-prefix-p other (buffer-file-name buf)))
+            (with-current-buffer buf (ecoin-mode -1))
+            (kill-buffer buf)))
+        (delete-directory other t)))))
+
+(ert-deftest ecoin-llama-test-different-projects-have-different-rings ()
+  (ecoin-llama-test--with-dir dir
+    (let* ((one (file-name-as-directory (expand-file-name "one" dir)))
+           (two (file-name-as-directory (expand-file-name "two" dir)))
+           (a (ecoin-llama-test--file one "a.py" (ecoin-llama-test--code "a" 10)))
+           (b (ecoin-llama-test--file two "b.py" (ecoin-llama-test--code "b" 10))))
+      (ecoin-llama--note-switch a)
+      (ecoin-llama--note-switch b)
+      (let ((ring-a (with-current-buffer a (ecoin-llama--current-ring)))
+            (ring-b (with-current-buffer b (ecoin-llama--current-ring))))
+        (should ring-a)
+        (should ring-b)
+        (should-not (eq ring-a ring-b))
+        (should (equal '("a.py") (mapcar (lambda (c) (plist-get c :filename))
+                                         (ecoin-llama--ring-queue ring-a))))
+        (should (equal '("b.py") (mapcar (lambda (c) (plist-get c :filename))
+                                         (ecoin-llama--ring-queue ring-b)))))
+      ;; Each project's requests carry only its own chunks.
+      (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+        (dolist (case (list (cons a "x_a.py") (cons b "x_b.py")))
+          (with-current-buffer (car case)
+            (ecoin-llama-test--put (ecoin-llama--current-ring t)
+                                   (list :filename (cdr case) :text "q\n"))))
+        (dolist (buffer (list a b))
+          (with-current-buffer buffer
+            (goto-char (point-max))
+            (ecoin--request 'manual)
+            (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))))
+        (let ((names (mapcar (lambda (r)
+                               (mapcar (lambda (o) (plist-get o :filename))
+                                       (plist-get (ecoin-llama-test--request-json r)
+                                                  :input_extra)))
+                             (seq-filter (lambda (r) (equal (plist-get r :path)
+                                                            ecoin-llama--path-infill))
+                                         ecoin-llama-test--requests))))
+          (should (equal '(("x_a.py") ("x_b.py")) names)))))))
+
+(ert-deftest ecoin-llama-test-excluded-files-never-contribute ()
+  (ecoin-llama-test--with-dir dir
+    (let* ((ecoin-exclude-file-regexps '("secret"))
+           (ecoin-llama-n-prefix 10)
+           (ecoin-llama-n-suffix 5)
+           (secret (ecoin-llama-test--file dir "secret.py"
+                                           (ecoin-llama-test--code "s" 300)))
+           (plain (ecoin-llama-test--file dir "plain.py"
+                                          (ecoin-llama-test--code "p" 10))))
+      ;; Buffer switches: leaving and entering.
+      (ecoin-llama--note-switch secret)
+      (ecoin-llama--note-switch plain)
+      (ecoin-llama--note-switch secret)
+      (should (equal '("plain.py")
+                     (mapcar (lambda (c) (plist-get c :filename))
+                             (ecoin-llama-test--queue plain))))
+      ;; Saves.
+      (with-current-buffer secret
+        (insert "# edit\n")
+        (save-buffer))
+      ;; Copies and kills.
+      (with-current-buffer secret
+        (let ((this-command 'kill-ring-save))
+          (kill-new (concat (ecoin-llama-test--code "k" 5) "\n"))
+          (ecoin-llama--on-command)))
+      (ecoin-llama--poll-kill)
+      ;; Far picks after a request.
+      (with-current-buffer secret
+        (goto-char (point-min))
+        (forward-line 150)
+        (ecoin-llama--maybe-far-pick (ecoin-llama--current-ring t)))
+      (should (equal '("plain.py")
+                     (mapcar (lambda (c) (plist-get c :filename))
+                             (ecoin-llama-test--queue plain)))))))
+
+(ert-deftest ecoin-llama-test-buffers-with-the-mode-off-never-contribute ()
+  (ecoin-llama-test--with-dir dir
+    (let ((a (ecoin-llama-test--file dir "a.py" (ecoin-llama-test--code "a" 10))))
+      (with-current-buffer a (ecoin-mode -1))
+      (ecoin-llama--note-switch a)
+      (with-current-buffer a (insert "x\n") (save-buffer))
+      (should-not (ecoin-llama-test--queue a)))))
+
+(ert-deftest ecoin-llama-test-ring-off-and-other-backends-do-nothing ()
+  (ecoin-llama-test--with-dir dir
+    (let ((a (ecoin-llama-test--file dir "a.py" (ecoin-llama-test--code "a" 10))))
+      (let ((ecoin-llama-ring-chunks 0))
+        (ecoin-llama--note-switch a)
+        (should-not (with-current-buffer a (ecoin-llama--current-ring t)))
+        (should (equal "ring off" (ecoin-llama--ring-status))))
+      (let ((ecoin-backend 'copilot))
+        (ecoin-llama--note-switch a)
+        (should-not (ecoin-llama-test--queue a)))
+      (setq ecoin-llama--prev-buffer nil)
+      (ecoin-llama--note-switch a)
+      (should (ecoin-llama-test--queue a)))))
+
+(defmacro ecoin-llama-test--with-ring (ring &rest body)
+  "Run BODY in an ecoin buffer, RING being its (empty) ring and the server ready."
+  (declare (indent 1))
+  `(ecoin-llama-test--in-buffer "x = 1\ny = 2\nz = 3\n"
+     (let ((,ring (ecoin-llama--current-ring t)))
+       (setq ecoin-llama--last-ring (cons ,ring (current-buffer)))
+       (ecoin-llama-test--prime-ready)
+       (ecoin-llama--note-activity)
+       ,@body)))
+
+(defun ecoin-llama-test--infill-bodies ()
+  "Parsed JSON bodies of the /infill requests seen, oldest first."
+  (mapcar #'ecoin-llama-test--request-json
+          (seq-filter (lambda (r) (equal (plist-get r :path) ecoin-llama--path-infill))
+                      ecoin-llama-test--requests)))
+
+(ert-deftest ecoin-llama-test-warmup-body-is-exactly-the-spec ()
+  (ecoin-llama-test--with-server (ecoin-llama-test--answer
+                                  (lambda (b) (if (eql 0 (plist-get b :n_predict))
+                                                  '(:body "{}")
+                                                "ghost")))
+    (ecoin-llama-test--with-ring ring
+      (let ((chunk (ecoin-llama-test--chunk "a")))
+        (ecoin-llama--enqueue ring chunk t)
+        (ecoin-llama--ring-tick)
+        (should (ecoin-llama-test--wait (lambda () (= 1 (ecoin-llama-test--infills)))))
+        (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+        (let ((body (car (ecoin-llama-test--infill-bodies))))
+          (should (equal "" (plist-get body :input_prefix)))
+          (should (equal "" (plist-get body :input_suffix)))
+          (should (equal "" (plist-get body :prompt)))
+          (should (equal (list (list :filename "a.py"
+                                     :text (plist-get chunk :text)))
+                         (plist-get body :input_extra)))
+          (should (eql 0 (plist-get body :n_predict)))
+          (should (plist-member body :samplers))
+          (should (null (plist-get body :samplers)))
+          (should (eq t (plist-get body :cache_prompt)))
+          (should (eql 1 (plist-get body :t_max_predict_ms)))
+          (should (equal '("") (plist-get body :response_fields)))
+          ;; Exactly these nine keys, no sampling options.
+          (should (= 9 (/ (length body) 2))))
+        (should (string-match-p "\"samplers\":\\[\\]"
+                                (plist-get (car ecoin-llama-test--requests) :body)))
+        ;; The chunk moved from the queue into the ring.
+        (should-not (ecoin-llama--ring-queue ring))
+        (should (equal (list chunk) (ecoin-llama--ring-chunks ring)))
+        ;; A warm-up is not a completion: no timings, no ghost, and nothing
+        ;; more is sent for an unchanged ring.
+        (should-not ecoin-llama--last-timings)
+        (should (= 1 (plist-get ecoin-llama--last-warmup :chunks)))
+        (ecoin-llama--ring-tick)
+        (ecoin-llama-test--settle 0.1)
+        (should (= 1 (ecoin-llama-test--infills)))
+        ;; The next chunk makes a second warm-up carrying both, oldest first.
+        (ecoin-llama--enqueue ring (ecoin-llama-test--chunk "b") t)
+        (ecoin-llama--ring-tick)
+        (should (ecoin-llama-test--wait (lambda () (= 2 (ecoin-llama-test--infills)))))
+        (should (equal '("a.py" "b.py")
+                       (mapcar (lambda (o) (plist-get o :filename))
+                               (plist-get (cadr (ecoin-llama-test--infill-bodies))
+                                          :input_extra))))))))
+
+(ert-deftest ecoin-llama-test-warmup-only-when-allowed ()
+  (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+    (ecoin-llama-test--with-ring ring
+      (let ((ready (lambda ()
+                     (ecoin-llama-test--prime-ready)
+                     (ecoin-llama--note-activity)
+                     (setq ecoin-llama--inflight nil
+                           ecoin-llama--backoff-until nil)))
+            (cases
+             (list
+              (cons "outside the activity window"
+                    (lambda () (setq ecoin-llama--last-activity
+                                     (- (float-time) 1000))))
+              (cons "no recent trigger at all"
+                    (lambda () (setq ecoin-llama--last-activity nil)))
+              (cons "sleeping" (lambda () (setq ecoin-llama--state 'sleeping)))
+              (cons "unknown" (lambda () (setq ecoin-llama--state 'unknown)))
+              (cons "down, in backoff"
+                    (lambda () (ecoin-llama--set-state 'down)))
+              (cons "unsupported"
+                    (lambda () (ecoin-llama--set-state 'unsupported)))
+              (cons "a request in flight"
+                    (lambda () (setq ecoin-llama--inflight
+                                     (ecoin-llama--make-job))))
+              (cons "a request queued"
+                    (lambda () (setq ecoin-llama--queued
+                                     (ecoin-llama--make-job))))
+              (cons "a stale last contact (would need a probe)"
+                    (lambda () (setq ecoin-llama--last-ok
+                                     (- (float-time) 1000)))))))
+        (ecoin-llama--enqueue ring (ecoin-llama-test--chunk "a") t)
+        (dolist (case cases)
+          (funcall ready)
+          (setq ecoin-llama--queued nil)
+          (funcall (cdr case))
+          (ecoin-llama--ring-tick)
+          (ecoin-llama-test--settle 0.05)
+          (ert-info ((car case))
+            (should (= 0 (ecoin-llama-test--infills)))
+            (should (= 0 (ecoin-llama-test--count ecoin-llama--path-props)))
+            (should (= 1 (length (ecoin-llama--ring-queue ring))))
+            (should-not (ecoin-llama--ring-chunks ring))))
+        ;; Allowed again: it goes out.
+        (funcall ready)
+        (setq ecoin-llama--queued nil)
+        (ecoin-llama--ring-tick)
+        (should (ecoin-llama-test--wait (lambda () (= 1 (ecoin-llama-test--infills)))))))))
+
+(ert-deftest ecoin-llama-test-ring-timer-runs-warms-up-and-stops-itself ()
+  (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+    (let ((ecoin-llama-ring-interval 0.05))
+      (ecoin-llama-test--with-ring ring
+        (should-not ecoin-llama--ring-timer)
+        (ecoin-llama--enqueue ring (ecoin-llama-test--chunk "a") t)
+        (ecoin-llama--ring-ensure-timer)
+        (should ecoin-llama--ring-timer)
+        (should (ecoin-llama-test--wait (lambda () (= 1 (ecoin-llama-test--infills)))))
+        ;; Still inside the window: it keeps running.
+        (ecoin-llama-test--settle 0.2)
+        (should ecoin-llama--ring-timer)
+        (setq ecoin-llama--last-activity (- (float-time) 1000))
+        (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--ring-timer))))
+        ;; Nothing restarts it without a trigger.
+        (ecoin-llama--ring-ensure-timer)
+        (should-not ecoin-llama--ring-timer)))))
+
+(ert-deftest ecoin-llama-test-ring-timer-needs-an-ecoin-buffer ()
+  (ecoin-llama--reset)
+  (ecoin-llama--note-activity)
+  (should-not (seq-some (lambda (b) (buffer-local-value 'ecoin-mode b))
+                        (buffer-list)))
+  (ecoin-llama--ring-ensure-timer)
+  (should-not ecoin-llama--ring-timer)
+  (ecoin-llama--reset))
+
+(ert-deftest ecoin-llama-test-requests-start-the-timer-and-a-zero-ring-does-not ()
+  (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+    (ecoin-llama-test--in-buffer "x = "
+      (let ((ecoin-llama-ring-chunks 0))
+        (ecoin-llama-test--show 'manual)
+        (should-not ecoin-llama--ring-timer))
+      (ecoin-dismiss)
+      (ecoin-llama-test--show 'manual)
+      (should ecoin-llama--ring-timer))))
+
+(ert-deftest ecoin-llama-test-ring-cap-evicts-the-oldest ()
+  (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+    (let ((ecoin-llama-ring-chunks 3))
+      (ecoin-llama-test--with-ring ring
+        (dotimes (i 5)
+          (ecoin-llama--enqueue ring (ecoin-llama-test--chunk (format "c%d" i)) t))
+        (dotimes (i 5)
+          (ecoin-llama--ring-tick)
+          (should (ecoin-llama-test--wait
+                   (lambda () (and (= (1+ i) (ecoin-llama-test--infills))
+                                   (null ecoin-llama--inflight))))))
+        (should (equal '("c2.py" "c3.py" "c4.py")
+                       (mapcar (lambda (c) (plist-get c :filename))
+                               (ecoin-llama--ring-chunks ring))))
+        (should-not (ecoin-llama--ring-queue ring))))))
+
+(ert-deftest ecoin-llama-test-warmup-drops-queued-chunks-like-the-text-at-point ()
+  (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+    (ecoin-llama-test--with-ring ring
+      (erase-buffer)
+      (insert (ecoin-llama-test--code "a" 5))
+      (ecoin-llama--enqueue ring (ecoin-llama-test--chunk "a") t)
+      (ecoin-llama--ring-tick)
+      (ecoin-llama-test--settle 0.1)
+      (should (= 0 (ecoin-llama-test--infills)))
+      (should-not (ecoin-llama--ring-queue ring))
+      (should-not (ecoin-llama--ring-chunks ring)))))
+
+(ert-deftest ecoin-llama-test-a-user-trigger-waits-for-a-warmup ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer
+       (lambda (b) (if (eql 0 (plist-get b :n_predict))
+                       (list :delay 0.3 :body "{}")
+                     "ghost")))
+    (ecoin-llama-test--with-ring ring
+      (ecoin-llama--enqueue ring (ecoin-llama-test--chunk "a") t)
+      (ecoin-llama--ring-tick)
+      (should (ecoin-llama-test--wait (lambda () (= 1 (ecoin-llama-test--infills)))))
+      (should (ecoin-llama--job-warmup ecoin-llama--inflight))
+      (goto-char (point-max))
+      (ecoin--request 'manual)
+      (should (ecoin-llama-test--wait #'ecoin-llama-test--ghost))
+      (should (= 2 (ecoin-llama-test--infills)))
+      (should (= 0 ecoin-llama-test--closed))
+      ;; The completion that followed carried the ring the warm-up warmed.
+      (should (equal '("a.py")
+                     (mapcar (lambda (o) (plist-get o :filename))
+                             (plist-get (cadr (ecoin-llama-test--infill-bodies))
+                                        :input_extra)))))))
+
+(ert-deftest ecoin-llama-test-completions-and-prefetches-send-the-ring ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--prefetch-answer "foo()\nbar()" "next")
+    (let ((ecoin-llama-prefetch t))
+      (ecoin-llama-test--in-buffer "x = "
+        (let ((ring (ecoin-llama--current-ring t))
+              (a (ecoin-llama-test--chunk "a"))
+              (b (ecoin-llama-test--chunk "b")))
+          (ecoin-llama-test--put ring a b)
+          (ecoin-llama-test--show)
+          (should (ecoin-llama-test--wait (lambda () (= 2 (ecoin-llama-test--infills)))))
+          (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight)))
+          (dolist (body (ecoin-llama-test--infill-bodies))
+            (should (equal '("a.py" "b.py")
+                           (mapcar (lambda (o) (plist-get o :filename))
+                                   (plist-get body :input_extra))))
+            (should (equal (plist-get a :text)
+                           (plist-get (car (plist-get body :input_extra)) :text)))))))))
+
+(ert-deftest ecoin-llama-test-request-time-eviction-reaches-the-request ()
+  (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+    (ecoin-llama-test--in-buffer (ecoin-llama-test--code "a" 5)
+      (let ((ring (ecoin-llama--current-ring t)))
+        ;; "a" repeats what is at point; "b" is unrelated.
+        (ecoin-llama-test--put ring (ecoin-llama-test--chunk "a")
+                               (ecoin-llama-test--chunk "b"))
+        (ecoin-llama-test--show 'manual)
+        (should (equal '("b.py")
+                       (mapcar (lambda (o) (plist-get o :filename))
+                               (plist-get (car (ecoin-llama-test--infill-bodies))
+                                          :input_extra))))
+        (should (= 1 (length (ecoin-llama--ring-chunks ring))))))))
+
+(ert-deftest ecoin-llama-test-context-exceeded-halves-the-extra-cap ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer
+       (lambda (b) (if (plist-get b :input_extra)
+                       '(:status 500
+                         :body (:error (:message "Context size has been exceeded.")))
+                     "ghost")))
+    (ecoin-llama-test--in-buffer "foo("
+      (let ((ring (ecoin-llama--current-ring t)))
+        (should (= 24000 (ecoin-llama--extra-cap)))
+        ;; Nothing extra was sent: shrinking the cap would not help.
+        (ecoin-llama-test--show 'manual)
+        (should (= 0 ecoin-llama--halvings))
+        (ecoin-dismiss)
+        (ecoin-llama-test--put ring (ecoin-llama-test--chunk "a"))
+        (insert "x")
+        (ecoin--request 'manual)
+        (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+        (should (= 1 ecoin-llama--halvings))
+        (should (= 12000 (ecoin-llama--extra-cap)))
+        (should (eq 'ready ecoin-llama--state))
+        (should (= 1 (length (ecoin-llama-test--messages-matching
+                              "ran out of context; halving"))))
+        ;; The cap follows the option, and another failure halves again, but
+        ;; the message stays single.
+        (let ((ecoin-llama-extra-max-chars 8000))
+          (should (= 4000 (ecoin-llama--extra-cap))))
+        (insert "y")
+        (ecoin--request 'manual)
+        (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+        (should (= 6000 (ecoin-llama--extra-cap)))
+        (should (= 1 (length (ecoin-llama-test--messages-matching
+                              "ran out of context"))))
+        ;; A restart forgets it.
+        (ecoin-llama--reset t)
+        (should (= 24000 (ecoin-llama--extra-cap)))))))
+
+(ert-deftest ecoin-llama-test-halving-is-announced-after-a-plain-500 ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer
+       (lambda (_) '(:status 500
+                     :body (:error (:message "Context size has been exceeded.")))))
+    (ecoin-llama-test--in-buffer "foo("
+      (let ((ring (ecoin-llama--current-ring t)))
+        (ecoin--request 'manual)
+        (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
+        (should (= 0 ecoin-llama--halvings))
+        (ecoin-llama-test--put ring (ecoin-llama-test--chunk "a"))
+        (dotimes (_ 2)
+          (insert "x")
+          (ecoin--request 'manual)
+          (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight)))))
+        (should (= 2 ecoin-llama--halvings))
+        (should (= 1 (length (ecoin-llama-test--messages-matching "no completion"))))
+        (should (= 1 (length (ecoin-llama-test--messages-matching "halving"))))))))
+
+(ert-deftest ecoin-llama-test-a-halved-cap-changes-what-is-sent ()
+  (ecoin-llama-test--with-server #'ecoin-llama-test--default-handler
+    (ecoin-llama-test--in-buffer "foo("
+      (let ((ring (ecoin-llama--current-ring t))
+            (ecoin-llama-extra-max-chars 400))
+        (ecoin-llama-test--put ring (ecoin-llama-test--chunk "a" 10)
+                               (ecoin-llama-test--chunk "b" 10))
+        (let ((full (cdr (ecoin-llama--ring-extra ring))))
+          (setq ecoin-llama--halvings 1)
+          (should-not (equal full (cdr (ecoin-llama--ring-extra ring))))
+          (should (equal ["b.py"]
+                         (vconcat (mapcar (lambda (o) (plist-get o :filename))
+                                          (car (ecoin-llama--ring-extra ring)))))))))))
+
+(ert-deftest ecoin-llama-test-the-cache-key-changes-with-the-ring ()
+  (ecoin-llama-test--with-server (ecoin-llama-test--answer (lambda (_) "foo()"))
+    (ecoin-llama-test--in-buffer "x = "
+      (let ((ring (ecoin-llama--current-ring t))
+            (a (ecoin-llama-test--chunk "a"))
+            (b (ecoin-llama-test--chunk "b")))
+        (ecoin-llama-test--put ring a)
+        (ecoin-llama-test--show)
+        (ecoin-dismiss)
+        (ecoin--request 'auto)
+        (should (equal "foo()" (ecoin-llama-test--ghost)))
+        (should (= 1 (ecoin-llama-test--infills)))
+        (ecoin-dismiss)
+        ;; A new chunk: the answer was computed with other extra context.
+        (ecoin-llama-test--put ring b)
+        (ecoin--request 'auto)
+        (ecoin-llama-test--wait #'ecoin-llama-test--ghost)
+        (should (= 2 (ecoin-llama-test--infills)))
+        (should (= 2 (length (plist-get (cadr (ecoin-llama-test--infill-bodies))
+                                        :input_extra))))
+        (ecoin-dismiss)
+        ;; The same extra text again finds the first answer.
+        (setf (ecoin-llama--ring-chunks ring) (list a))
+        (cl-incf (ecoin-llama--ring-version ring))
+        (ecoin--request 'auto)
+        (should (equal "foo()" (ecoin-llama-test--ghost)))
+        (should (= 2 (ecoin-llama-test--infills)))))))
+
+(ert-deftest ecoin-llama-test-typed-through-still-hits-with-an-unchanged-ring ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer (lambda (_) "foo(bar, baz)"))
+    (ecoin-llama-test--in-buffer "x = "
+      (ecoin-llama-test--put (ecoin-llama--current-ring t)
+                             (ecoin-llama-test--chunk "a"))
+      (ecoin-llama-test--show)
+      (ecoin-dismiss)
+      (insert "foo(b")
+      (ecoin--request 'auto)
+      (should (equal "ar, baz)" (ecoin-llama-test--ghost)))
+      (should (= 1 (ecoin-llama-test--infills)))
+      ;; With another ring the same typing is a miss.
+      (ecoin-dismiss)
+      (ecoin-llama-test--put (ecoin-llama--current-ring) (ecoin-llama-test--chunk "b"))
+      (insert "a")
+      (ecoin--request 'auto)
+      (ecoin-llama-test--wait (lambda () (= 2 (ecoin-llama-test--infills))))
+      (should (= 2 (ecoin-llama-test--infills))))))
+
+(ert-deftest ecoin-llama-test-shifted-keys-keep-the-extra-id ()
+  (let ((ctx (list :prefix "a\nb\nc\n" :middle "m" :suffix "\n" :extra-id "id1")))
+    (ecoin-llama--cache-store ctx '("x"))
+    (should (ecoin-llama--cache-has-p ctx))
+    (should (ecoin-llama--cache-lookup
+             (list :prefix "b\nc\n" :middle "m" :suffix "\n" :extra-id "id1")))
+    (should-not (ecoin-llama--cache-lookup
+                 (list :prefix "b\nc\n" :middle "m" :suffix "\n" :extra-id "id2")))
+    (should-not (ecoin-llama--cache-lookup
+                 (list :prefix "b\nc\n" :middle "m" :suffix "\n")))))
+
+(ert-deftest ecoin-llama-test-status-shows-the-ring ()
+  (ecoin-llama-test--in-buffer "x = "
+    (should (string-match-p "ring 0 chunks / 0 queued / 0 extra chars"
+                            (ecoin-backend-status 'llama)))
+    (let ((ring (ecoin-llama--current-ring t)))
+      (ecoin-llama-test--put ring (ecoin-llama-test--chunk "a" 3))
+      (ecoin-llama--enqueue ring (ecoin-llama-test--chunk "b") t)
+      (should (string-match-p
+               (format "ring 1 chunks / 1 queued / %d extra chars"
+                       (length (plist-get (ecoin-llama-test--chunk "a" 3) :text)))
+               (ecoin-backend-status 'llama))))
+    (ecoin-llama--reset)))
+
+(ert-deftest ecoin-llama-test-reset-forgets-the-rings ()
+  (ecoin-llama-test--in-buffer "x = "
+    (let ((ring (ecoin-llama--current-ring t)))
+      (ecoin-llama--enqueue ring (ecoin-llama-test--chunk "a") t)
+      (setq ecoin-llama--last-ring (cons ring (current-buffer)))
+      (ecoin-llama--reset)
+      (should-not ecoin-llama--last-ring)
+      (should (= 0 (hash-table-count ecoin-llama--rings))))))
+
 (provide 'ecoin-llama-test)
 ;;; ecoin-llama-test.el ends here
