@@ -1,21 +1,38 @@
 # Setup
 
-ecoin has a pluggable backend, chosen with `ecoin-backend`. `copilot` (GitHub Copilot, in `ecoin-copilot.el`) is the only backend today and stays the default for now; it is loaded on first use. A full README rewrite will follow once more backends exist.
-
-```
-npm install -g @github/copilot-language-server
-```
+ecoin has a pluggable backend, chosen with `ecoin-backend`: `llama` (the default; a local llama.cpp server's `/infill` endpoint, in `ecoin-llama.el`) or `copilot` (GitHub Copilot, in `ecoin-copilot.el`). Each is loaded on first use. A full README rewrite will follow once more backends exist.
 
 ```elisp
 (add-to-list 'load-path "/path/to/ecoin")
 (require 'ecoin)
 (add-hook 'prog-mode-hook #'ecoin-mode)   ; or (global-ecoin-mode)
 ```
+
+## llama backend (default)
+
+Run a llama-server with a FIM-capable model, for example `llama-server --fim-qwen-1.5b-default`, then point ecoin at it:
+
+```elisp
+(setq ecoin-llama-url "http://127.0.0.1:8012"   ; http only
+      ecoin-llama-api-key "~/.llama-key")       ; nil, a key, a file holding it, or a function
+```
+
+Only requests to `ecoin-llama-url` are made, and nothing is sent for files matching `ecoin-exclude-file-regexps`. If the server is down, asleep, loading, rejects the key or has no FIM tokens, ecoin shows one message, a mode-line marker (`ecoin[z]` sleeping, `ecoin[!]` failing) and backs off instead of failing on every keystroke; `M-x ecoin-status` shows the state and `M-x ecoin-restart` resets it. `ecoin-complete` asks for several alternatives (M-n / M-p), up to the server's slot count.
+
+## Copilot backend
+
+```
+npm install -g @github/copilot-language-server
+```
+
+```elisp
+(setq ecoin-backend 'copilot)
+```
 Then `M-x ecoin-login` once.
 
 **Keys (only active while ghost text is shown)**: `TAB` accept, `C-TAB` accept a word, `M-n`/`M-p` cycle alternatives; anything else dismisses. `ecoin-accept-line` exists but is unbound. Rebind in `ecoin-completion-map`.
 
-**How it works, briefly**
+**How the Copilot backend works, briefly**
 
 - One global jsonrpc connection, started lazily on the first request.
 - Full-buffer `didChange` right before each request (simple and can't drift out of sync).
