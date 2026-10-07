@@ -334,15 +334,22 @@ Signal a `user-error' when the URL or the key cannot be used."
        (fboundp 'json-available-p)
        (json-available-p)))
 
+(defun ecoin-llama--unibyte (string)
+  "Return the encoded STRING with the unibyte flag set.
+`encode-coding-string' leaves a pure-ASCII multibyte string as it is on
+Emacs 28 and 29, and concatenating that would make the request multibyte."
+  (if (multibyte-string-p string) (string-to-unibyte string) string))
+
 (defun ecoin-llama--encode-body (object)
   "Serialize the plist OBJECT to a unibyte UTF-8 string."
-  (encode-coding-string
-   (if (ecoin-llama--native-json-p)
-       (json-serialize object)
-     (require 'json)
-     (let ((json-false :false) (json-null :null))
-       (json-encode object)))
-   'utf-8 t))
+  (ecoin-llama--unibyte
+   (encode-coding-string
+    (if (ecoin-llama--native-json-p)
+        (json-serialize object)
+      (require 'json)
+      (let ((json-false :false) (json-null :null))
+        (json-encode object)))
+    'utf-8 t)))
 
 (defun ecoin-llama--parse-json (string)
   "Parse the JSON STRING to plists and lists; nil for false, null or garbage."
@@ -360,7 +367,7 @@ Signal a `user-error' when the URL or the key cannot be used."
   "Return STRING as unibyte ASCII; signal an error if it holds anything else."
   (when (string-match-p "[^\0-\177]" string)
     (error "Non-ASCII HTTP header"))
-  (encode-coding-string string 'us-ascii))
+  (ecoin-llama--unibyte (encode-coding-string string 'us-ascii)))
 
 (defun ecoin-llama--request-bytes (target method path payload)
   "Return the unibyte request for METHOD PATH on TARGET; PAYLOAD is unibyte or nil."
