@@ -269,7 +269,9 @@ a /props that answers while /infill keeps failing cannot reset them."
          (raw (cond ((null setting) nil)
                     ((functionp setting) (funcall setting))
                     ((stringp setting)
-                     (let ((file (expand-file-name setting)))
+                     ;; Not against `default-directory': in a TRAMP buffer that
+                     ;; would stat a remote host on every request.
+                     (let ((file (expand-file-name setting "~/")))
                        (if (and (file-readable-p file)
                                 (not (file-directory-p file)))
                            (ecoin-llama--key-from-file file)

@@ -260,6 +260,16 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
   (let ((ecoin-llama-api-key "   "))
     (should-not (ecoin-llama--api-key))))
 
+(ert-deftest ecoin-llama-test-key-lookup-ignores-default-directory ()
+  (let ((default-directory "/ssh:nohost:/home/")
+        (ecoin-llama-api-key "sk-literal")
+        (seen nil))
+    (cl-letf (((symbol-function 'file-readable-p)
+               (lambda (f) (push f seen) nil)))
+      (should (equal "sk-literal" (ecoin-llama--api-key))))
+    (should seen)
+    (should-not (cl-some #'file-remote-p seen))))
+
 (ert-deftest ecoin-llama-test-bad-keys-are-user-errors ()
   (dolist (key '("kéy" "ke\ny" "ke\r\ny" "\U0001F600"))
     (let ((ecoin-llama-api-key key))
@@ -640,7 +650,7 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
           (cond ((equal (plist-get r :path) ecoin-llama--path-props)
                  (list :body ecoin-llama-test--props))
                 (t (cl-incf infills) '(:hang t))))
-      (let ((ecoin-llama-request-timeout 0.2))
+      (let ((ecoin-llama-request-timeout 1))
         (ecoin-llama-test--in-buffer "foo("
           (ecoin--request 'manual)
           (should (ecoin-llama-test--wait (lambda () (null ecoin-llama--inflight))))
@@ -656,8 +666,8 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
         (if (equal (plist-get r :path) ecoin-llama--path-props)
             (list :body (plist-put (copy-sequence ecoin-llama-test--props)
                                    :is_sleeping t))
-          '(:delay 0.6 :body (:content "ghost"))))
-    (let ((ecoin-llama-request-timeout 0.3)
+          '(:delay 1.5 :body (:content "ghost"))))
+    (let ((ecoin-llama-request-timeout 1)
           (ecoin-llama-wake-timeout 5))
       (ecoin-llama-test--in-buffer "foo("
         ;; Healthy long ago: the server has gone to sleep since.
@@ -708,6 +718,8 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
         (should (= 1 (length ecoin-llama-test--messages)))
         (should (eq 'error ecoin-llama--state))
         (should (equal " ecoin[!]" (ecoin--lighter)))
+        (should (string-match-p "ecoin\\[!\\]"
+                                (ecoin-llama-test--rendered-lighter)))
         ;; A manual trigger signals, and the core shows the error.
         (ecoin--request 'manual)
         (should (= 2 (length ecoin-llama-test--messages)))
@@ -715,6 +727,21 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
         (ecoin--request 'auto)
         (should-not ecoin-llama--config-failed)
         (ecoin-llama--reset)))))
+
+;; `format-mode-line' returns "" in batch mode, so evaluate the :eval entry the
+;; mode registered in `minor-mode-alist' by hand.
+(defun ecoin-llama-test--rendered-lighter ()
+  "The text of `ecoin-mode's entry in `minor-mode-alist' for this buffer."
+  (pcase (cadr (assq 'ecoin-mode minor-mode-alist))
+    (`(:eval ,form) (eval form t))))
+
+(ert-deftest ecoin-llama-test-lighter-reaches-the-mode-line ()
+  (ecoin-llama-test--in-buffer "foo("
+    (setq ecoin-llama--state 'down)
+    (should (string-match-p "ecoin\\[!\\]" (ecoin-llama-test--rendered-lighter)))
+    (setq ecoin-llama--state 'ready)
+    (should-not (string-match-p "ecoin\\[" (ecoin-llama-test--rendered-lighter)))
+    (ecoin-llama--reset)))
 
 (ert-deftest ecoin-llama-test-status-and-mode-line ()
   (ecoin-llama--reset)
