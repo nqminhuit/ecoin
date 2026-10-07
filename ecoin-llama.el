@@ -38,6 +38,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'url-util)
 (require 'ecoin)
 
 ;; json.el is loaded only when Emacs has no native JSON.
@@ -66,6 +67,11 @@ a string.  Surrounding whitespace is ignored."
   :type '(choice (const :tag "None" nil)
                  (string :tag "Key or file name")
                  function))
+
+(defcustom ecoin-llama-model nil
+  "Model id the server routes requests by, or nil to send none.
+Nil suits a single-model server; a llama.cpp router needs a string."
+  :type '(choice (const nil) string))
 
 (defcustom ecoin-llama-n-prefix 256
   "Number of lines above the cursor line sent as context."
@@ -187,6 +193,7 @@ Lower than for a user request because a prefetch holds the single flight."
 (defvar ecoin-llama--warned-loopback nil "Non-nil once the non-loopback warning ran.")
 (defvar ecoin-llama--config-failed nil "Non-nil while the state is a config error.")
 (defvar ecoin-llama--last-key nil "Last resolved API key, to notice changes.")
+(defvar ecoin-llama--last-model nil "Last `ecoin-llama-model', to notice changes.")
 (defvar ecoin-llama--key-file-cache nil "(FILE MTIME . KEY) of the last key file read.")
 (defvar ecoin-llama--inflight nil "The `ecoin-llama--job' being served.")
 (defvar ecoin-llama--queued nil "The newest job waiting for the one in flight.")
@@ -373,9 +380,19 @@ a /props that answers while /infill keeps failing cannot reset them."
            "ecoin: the llama API key must be printable ASCII on one line"))
         (unless (string-empty-p key) key)))))
 
+(defun ecoin-llama--sync-model ()
+  "Reset the server state if `ecoin-llama-model' changed; signal if it is invalid.
+Cached completions, the warm-up and /props belong to the previous model."
+  (let ((model ecoin-llama-model))
+    (when (and model (not (and (stringp model) (not (string-blank-p model)))))
+      (user-error "ecoin: ecoin-llama-model must be nil or a non-blank string"))
+    (unless (equal model ecoin-llama--last-model)
+      (ecoin-llama--reset t)
+      (setq ecoin-llama--last-model model))))
+
 (defun ecoin-llama--target ()
   "Return the `ecoin-llama--target' for the current settings.
-Signal a `user-error' when the URL or the key cannot be used."
+Signal a `user-error' when the URL, the key or the model cannot be used."
   (let ((url ecoin-llama-url))
     (unless (and (stringp url) (string-match ecoin-llama--url-regexp url))
       (user-error "ecoin: ecoin-llama-url is not a valid http URL"))
@@ -386,6 +403,8 @@ Signal a `user-error' when the URL or the key cannot be used."
            (host (if bracketed (substring raw-host 1 -1) raw-host))
            (port (if-let* ((p (match-string 3 url))) (string-to-number p) 80))
            (base (string-trim-right (or (match-string 4 url) "") "/+"))
+           ;; Before the key: a reset forgets `ecoin-llama--last-key'.
+           (_ (ecoin-llama--sync-model))
            (key (ecoin-llama--api-key)))
       (when (and ecoin-llama-warn-non-loopback
                  (not ecoin-llama--warned-loopback)
@@ -404,6 +423,8 @@ Signal a `user-error' when the URL or the key cannot be used."
 
 (defconst ecoin-llama--http-buffer-name " *ecoin-llama-http*")
 (defconst ecoin-llama--path-props "/props")
+(defconst ecoin-llama--props-query "?model=%s&autoload=false"
+  "Query that asks a router for one model's /props without loading it.")
 (defconst ecoin-llama--path-infill "/infill")
 (defconst ecoin-llama--crlf "\r\n")
 
@@ -717,19 +738,61 @@ once, unless the returned connection is cancelled."
   (ecoin-llama--set-state
    'down (format "ecoin: llama server unreachable at %s" ecoin-llama-url)))
 
+(defun ecoin-llama--props-path ()
+  "The path to probe: /props, for the configured model if there is one."
+  (if-let* ((model (and (stringp ecoin-llama-model) ecoin-llama-model)))
+      (concat ecoin-llama--path-props
+              (format ecoin-llama--props-query (url-hexify-string model)))
+    ecoin-llama--path-props))
+
+;; These match llama.cpp's router texts, which may change between versions.
+(defconst ecoin-llama--router-not-loaded "model is not loaded")
+(defconst ecoin-llama--router-not-found-regexp "\\`model '.*' not found\\'")
+(defconst ecoin-llama--router-role "router")
+
+(defun ecoin-llama--probe-router-answer (status body)
+  "Classify a router's 400 for the set model: `not-loaded', `not-found' or nil."
+  (when (and (eql status 400) (stringp ecoin-llama-model))
+    (let ((msg (ecoin-llama--error-message body)))
+      (cond ((equal msg ecoin-llama--router-not-loaded) 'not-loaded)
+            ((string-match-p ecoin-llama--router-not-found-regexp msg)
+             'not-found)))))
+
 (defun ecoin-llama--probe (job next)
   "GET /props for JOB, then call NEXT with JOB if the server answers."
   (setf (ecoin-llama--job-conn job)
         (ecoin-llama--http
-         (ecoin-llama--job-target job) "GET" ecoin-llama--path-props nil
+         (ecoin-llama--job-target job) "GET" (ecoin-llama--props-path) nil
          ecoin-llama-request-timeout
          (lambda (result)
            (setf (ecoin-llama--job-conn job) nil)
-           (let ((status (plist-get result :status)))
+           (let* ((status (plist-get result :status))
+                  (router (ecoin-llama--probe-router-answer
+                           status (plist-get result :body))))
              (cond
               ((null status) (ecoin-llama--down) (ecoin-llama--finish job))
+              ((eq router 'not-loaded)
+               (ecoin-llama--set-state
+                'sleeping (format "ecoin: loading %s on the llama server..."
+                                  ecoin-llama-model))
+               ;; Only a user's request may make the router load the model.
+               (if (ecoin-llama--job-callback job)
+                   (funcall next job)
+                 (ecoin-llama--finish job)))
+              ((eq router 'not-found)
+               (ecoin-llama--set-state
+                'error (format "ecoin: llama server has no model %s; check `ecoin-llama-model'"
+                               ecoin-llama-model))
+               (ecoin-llama--finish job))
               ((/= status 200)
                (ecoin-llama--http-failure status (plist-get result :body))
+               (ecoin-llama--finish job))
+              ((and (null ecoin-llama-model)
+                    (equal (plist-get (plist-get result :body) :role)
+                           ecoin-llama--router-role))
+               (ecoin-llama--set-state
+                'error (format "ecoin: %s is a llama.cpp router; set `ecoin-llama-model'"
+                               ecoin-llama-url))
                (ecoin-llama--finish job))
               (t
                (let ((props (plist-get result :body)))
@@ -759,12 +822,17 @@ once, unless the returned connection is cancelled."
 (defconst ecoin-llama--forbidden-fields '(:t_max_prompt_ms :n_cache_reuse :model)
   "Fields that must never be sent, even from `ecoin-llama-sampling'.")
 
+(defun ecoin-llama--model-field ()
+  "The request-body fields that name the model; the setting is the only source."
+  (when (stringp ecoin-llama-model) (list :model ecoin-llama-model)))
+
 (defun ecoin-llama--warmup-body (job)
   "The /infill plist of the warm-up JOB: only the extra context, no generation."
   (append (list :input_prefix "" :input_suffix "" :prompt ""
                 :input_extra (or (ecoin-llama--job-extra job) [])
                 :n_predict 0 :samplers [] :cache_prompt t
                 :t_max_predict_ms 1 :response_fields [""])
+          (ecoin-llama--model-field)
           (when ecoin-llama-slot (list :id_slot ecoin-llama-slot))))
 
 (defun ecoin-llama--request-body (job)
@@ -791,6 +859,7 @@ once, unless the returned connection is cancelled."
                       :stream :false
                       :cache_prompt t
                       :response_fields ecoin-llama--response-fields)
+                (ecoin-llama--model-field)
                 (when ecoin-llama-slot (list :id_slot ecoin-llama-slot))
                 (when (> n 1) (list :n_cmpl n))))
          (extra nil))
@@ -1802,6 +1871,8 @@ probes, since the ring has no business waking a sleeping model."
 (cl-defmethod ecoin-backend-request ((_backend (eql 'llama)) request callback)
   "Ask the server for completions for REQUEST; CALLBACK gets the items.
 An automatic request is answered from the cache when it can be, at once."
+  ;; Before the cache lookup, which a model change must invalidate.
+  (condition-case nil (ecoin-llama--sync-model) (user-error nil))
   (ecoin-llama--note-activity)
   (let* ((manual (eq (ecoin-request-trigger request) 'manual))
          (ring (ecoin-llama--current-ring t))
@@ -1944,10 +2015,14 @@ network."
 
 (cl-defmethod ecoin-backend-status ((_backend (eql 'llama)))
   "Describe the server and the state of the connection."
-  (let ((model (or (plist-get ecoin-llama--props :model_alias)
-                   (plist-get ecoin-llama--props :model_path))))
+  (let* ((server (or (plist-get ecoin-llama--props :model_alias)
+                     (plist-get ecoin-llama--props :model_path)))
+         (model (if (stringp ecoin-llama-model)
+                    (format "%s (server: %s)" ecoin-llama-model
+                            (or server "unknown"))
+                  (or server "unknown"))))
     (format "backend llama; state %s; url %s; model %s; slots %s; last error %s; backoff %s; %s"
-            ecoin-llama--state ecoin-llama-url (or model "unknown")
+            ecoin-llama--state ecoin-llama-url model
             (or (plist-get ecoin-llama--props :total_slots) "unknown")
             (or ecoin-llama--last-error "none")
             (if (ecoin-llama--in-backoff-p)

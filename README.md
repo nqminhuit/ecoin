@@ -60,6 +60,8 @@ Then point ecoin at it:
 
 ecoin checks `/props`, so it notices a server that is down, asleep, still loading, rejecting the key, or running a model without FIM tokens. Each of those costs one message, a mode-line marker and a backoff, not an error per keystroke. A sleeping server (the `/props` `is_sleeping` flag) is woken by the next request, which then uses a long timeout.
 
+A llama.cpp router (`llama-server --models-preset ...`) serves several models and picks one per request by its name, so set `ecoin-llama-model` to the preset name, for example `(setq ecoin-llama-model "qwen2.5-coder-1.5b-q8_0.gguf")`. ecoin then names the model in every request and checks its `/props` without loading it. The first request after switching waits for the model to load (about 1-6 s on a GPU); ecoin may briefly use the fallback meanwhile. Changing the option clears the cached completions. With the default `nil`, ecoin sends no model, which is what a single-model server expects; against a router it reports that `ecoin-llama-model` is missing.
+
 Behaviour worth knowing:
 
 - Answers are cached, so repeating a request or typing through a suggestion costs no request.
@@ -74,6 +76,7 @@ Behaviour worth knowing:
 | --- | --- | --- |
 | `ecoin-llama-url` | `"http://127.0.0.1:8012"` | Server root; http only. A non-loopback host triggers a one-time warning (`ecoin-llama-warn-non-loopback`). |
 | `ecoin-llama-api-key` | `nil` | Key, key file name, or function returning the key. |
+| `ecoin-llama-model` | `nil` | Model id a llama.cpp router routes by; `nil` sends none (single-model server). |
 | `ecoin-llama-n-prefix` | 256 | Lines above the cursor line sent as context. |
 | `ecoin-llama-n-suffix` | 64 | Lines below the cursor line sent as context. |
 | `ecoin-llama-n-predict` | 128 | Maximum tokens generated. |
