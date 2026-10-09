@@ -1138,6 +1138,19 @@ The first of LINES continues the current line and is never dropped."
         (= depth 0))
     (cl-evenp (seq-count (lambda (c) (eq c char)) str))))
 
+(defun ecoin-llama--trim-unbalances-p (before first after tail)
+  "Non-nil if dropping TAIL from FIRST would unbalance a closer or quote of TAIL.
+That is, the line is balanced with FIRST and AFTER but not without TAIL,
+as when FIRST is a(b) and AFTER is the auto-paired closer."
+  (let ((trimmed (substring first 0 (- (length first) (length tail)))))
+    (cl-some (lambda (c)
+               (and (or (memq c ecoin-llama--quote-chars)
+                        (rassq c ecoin-llama--bracket-pairs))
+                    (ecoin-llama--char-balanced-p (concat before first after) c)
+                    (not (ecoin-llama--char-balanced-p
+                          (concat before trimmed after) c))))
+             (seq-uniq (string-to-list tail)))))
+
 (defun ecoin-llama--replaces-closers-p (before ghost after)
   "Non-nil if GHOST already carries the closers of AFTER that auto-pairing added.
 That is, BEFORE+GHOST+AFTER is unbalanced for each closer or quote in AFTER
@@ -1189,7 +1202,9 @@ line, since the core's dedent step on delivery removes it."
             (when (string-match-p "[^ \t]" text-after)
               (let ((first (car lines))
                     (tail (string-trim text-after)))
-                (when (and (> (length tail) 0) (string-suffix-p tail first))
+                (when (and (> (length tail) 0) (string-suffix-p tail first)
+                           (not (ecoin-llama--trim-unbalances-p
+                                 text-before first text-after tail)))
                   (setq first (substring first 0 (- (length first)
                                                     (length tail)))))
                 (when (and (equal first (car lines))

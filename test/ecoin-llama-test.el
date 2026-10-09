@@ -1097,31 +1097,33 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
 
 (defconst ecoin-llama-test--replace-cases
   '(;; Auto-paired closers the suggestion already carries are replaced.
-    ("feat(|)" "doom): ecoin" t)
-    ("s = \"|\"" "foo\", bar" t)
+    ("feat(|)" "doom): ecoin" "doom): ecoin" t)
+    ("s = \"|\"" "foo\", bar" "foo\", bar" t)
     ;; The existing closer closes the suggestion's opener.
-    ("f(|)" "a(b)" nil)
-    ("f(|)" "a" nil)
-    ("s = \"|\"" "foo" nil)
-    ;; The existing trim already handles these.
-    ("f(|)" "a, b)" nil)
-    ("f(|)" "a(b))" nil)
+    ("f(|)" "a(b)" "a(b)" nil)
+    ("f(|)" "a" "a" nil)
+    ("s = \"|\"" "foo" "foo" nil)
+    ;; The existing trim handles these.
+    ("f(|)" "a, b)" "a, b" nil)
+    ("f(|)" "a(b))" "a(b)" nil)
+    ("s = \"|\"" "foo\"" "foo" nil)
     ;; Text after point that is not closers is never replaced.
-    ("f(|) + g(x)" "doom)" nil)
-    ("(|) x" "a)" nil)
-    ("f(|)" "\nfoo" nil))
-  "(BUFFER CONTENT REPLACE) for whether accepting replaces the line's tail.")
+    ("f(|) + g(x)" "doom)" "doom)" nil)
+    ("(|) x" "a)" "a)" nil)
+    ("f(|)" "\nfoo" nil nil))
+  "(BUFFER CONTENT TEXT REPLACE) for what accepting inserts and replaces.")
 
 (ert-deftest ecoin-llama-test-postprocess-replaces-autopaired-closers ()
   (dolist (case ecoin-llama-test--replace-cases)
-    (pcase-let ((`(,buffer ,content ,expected) case))
+    (pcase-let ((`(,buffer ,content ,text ,replace) case))
       (with-temp-buffer
         (insert buffer)
         (goto-char (point-min))
         (search-forward "|")
         (delete-char -1)
         (let ((res (ecoin-llama--postprocess-replace content)))
-          (should (eq expected (and (cdr res) t))))))))
+          (should (equal text (car res)))
+          (should (eq replace (and (cdr res) t))))))))
 
 (ert-deftest ecoin-llama-test-items-end-is-the-line-end-when-replacing ()
   (with-temp-buffer
