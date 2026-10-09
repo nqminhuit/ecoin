@@ -284,7 +284,11 @@
     (ecoin--request 'manual)
     (should (equal ")" (ecoin-test--hidden)))
     (should (equal "feat()" (buffer-string)))
-    (should (eq t (ecoin-test--after-string-cursor)))))
+    (should (eq t (ecoin-test--after-string-cursor)))
+    ;; An after-string right before invisible text is never drawn.
+    (should-not (overlay-get ecoin--overlay 'after-string))
+    (should (equal "doom)" (substring-no-properties
+                            (overlay-get ecoin--hidden-overlay 'before-string))))))
 
 (ert-deftest ecoin-test-no-end-or-an-end-at-point-hides-nothing ()
   (ecoin-test--with-buffer "feat()"
@@ -407,9 +411,14 @@
   (setq ecoin-test--items (list (ecoin-test--item ghost)))
   (ecoin--request 'manual))
 
+(defun ecoin-test--ghost-string ()
+  "The ghost string: the after-string, or the hidden overlay's before-string."
+  (or (overlay-get ecoin--overlay 'after-string)
+      (and ecoin--hidden-overlay (overlay-get ecoin--hidden-overlay 'before-string))))
+
 (defun ecoin-test--after-string-cursor ()
-  "The `cursor' property on char 0 of the ghost's after-string."
-  (get-text-property 0 'cursor (overlay-get ecoin--overlay 'after-string)))
+  "The `cursor' property on char 0 of the ghost string."
+  (get-text-property 0 'cursor (ecoin-test--ghost-string)))
 
 (ert-deftest ecoin-test-insert-state-p-without-evil ()
   (with-temp-buffer
@@ -497,7 +506,7 @@
 (ert-deftest ecoin-test-leading-newline-gets-a-space-for-the-cursor ()
   (ecoin-test--with-buffer ""
     (ecoin-test--show "def f():" "\n    return 1")
-    (let ((str (overlay-get ecoin--overlay 'after-string)))
+    (let ((str (ecoin-test--ghost-string)))
       (should (equal " \n    return 1" (substring-no-properties str)))
       (should (eq t (get-text-property 0 'cursor str))))
     (should (equal "\n    return 1" (ecoin-test--ghost)))))
@@ -731,8 +740,7 @@
 (ert-deftest ecoin-test-displayed-ghost-equals-the-accepted-insertion ()
   (ecoin-test--with-buffer ""
     (ecoin-test--show "def f():\n    " "    return x")
-    (let ((shown (substring-no-properties
-                  (overlay-get ecoin--overlay 'after-string))))
+    (let ((shown (substring-no-properties (ecoin-test--ghost-string))))
       (ecoin-accept)
       (should (equal shown (cadar ecoin-test--accepted)))
       (should (equal "def f():\n    return x" (buffer-string))))))
