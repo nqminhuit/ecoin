@@ -603,16 +603,19 @@ TRIGGER is `auto' or `manual'."
          (kov (make-overlay p (min (1+ p) (point-max)) nil nil t)))
     ;; Non-integer `cursor' is ignored when point is visible, i.e. mid-line.
     (put-text-property 0 1 'cursor (if eol t 1) str)
-    (overlay-put ov 'after-string str)
     (overlay-put ov 'window (selected-window))
     (overlay-put ov 'priority ecoin-overlay-priority)
     (overlay-put ov 'ecoin-start p)
     (overlay-put ov 'ecoin-end (copy-marker end))
     (overlay-put ov 'ecoin-item item)
     ;; Accepting replaces [p, end], so the ghost must not show that text.
-    (when (> end p)
+    ;; Redisplay drops an after-string right before invisible text, so the
+    ;; ghost then rides on the invisible overlay as its before-string.
+    (if (<= end p)
+        (overlay-put ov 'after-string str)
       (let ((hov (make-overlay p end nil t nil)))
         (overlay-put hov 'invisible t)
+        (overlay-put hov 'before-string str)
         (overlay-put hov 'window (selected-window))
         (overlay-put hov 'priority ecoin-overlay-priority)
         (setq ecoin--hidden-overlay hov)))
