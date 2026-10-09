@@ -1121,8 +1121,60 @@ The first of LINES continues the current line and is never dropped."
             (pop src))
           (nreverse src))))))
 
+(defconst ecoin-llama--bracket-pairs '((?\( . ?\)) (?\[ . ?\]) (?{ . ?}))
+  "Opener and closer chars checked for balance on a line.")
+(defconst ecoin-llama--quote-chars '(?\" ?\' ?`)
+  "Quote chars checked by parity on a line.")
+
+(defun ecoin-llama--char-balanced-p (str char)
+  "Non-nil if CHAR is balanced in STR: a quote by parity, a closer by depth."
+  (if-let* ((open (car (rassq char ecoin-llama--bracket-pairs))))
+      (let ((depth 0))
+        (seq-doseq (c str)
+          (cond ((eq c open) (setq depth (1+ depth)))
+                ((eq c char) (setq depth (1- depth))))
+          ;; A closer without opener stays unbalanced whatever follows.
+          (when (< depth 0) (setq depth most-negative-fixnum)))
+        (= depth 0))
+    (cl-evenp (seq-count (lambda (c) (eq c char)) str))))
+
+(defun ecoin-llama--trim-unbalances-p (before first after tail)
+  "Non-nil if dropping TAIL from FIRST would unbalance a closer or quote of TAIL.
+That is, the line is balanced with FIRST and AFTER but not without TAIL,
+as when FIRST is a(b) and AFTER is the auto-paired closer."
+  (let ((trimmed (substring first 0 (- (length first) (length tail)))))
+    (cl-some (lambda (c)
+               (and (or (memq c ecoin-llama--quote-chars)
+                        (rassq c ecoin-llama--bracket-pairs))
+                    (ecoin-llama--char-balanced-p (concat before first after) c)
+                    (not (ecoin-llama--char-balanced-p
+                          (concat before trimmed after) c))))
+             (seq-uniq (string-to-list tail)))))
+
+(defun ecoin-llama--replaces-closers-p (before ghost after)
+  "Non-nil if GHOST already carries the closers of AFTER that auto-pairing added.
+That is, BEFORE+GHOST+AFTER is unbalanced for each closer or quote in AFTER
+while BEFORE+GHOST is balanced.  AFTER must hold nothing but closers."
+  (let ((chars (seq-filter (lambda (c) (or (memq c ecoin-llama--quote-chars)
+                                           (rassq c ecoin-llama--bracket-pairs)))
+                           (seq-uniq (string-to-list after)))))
+    (and chars
+         (string-match-p ecoin-llama-line-suffix-regexp after)
+         (cl-every (lambda (c)
+                     (and (ecoin-llama--char-balanced-p (concat before ghost) c)
+                          (not (ecoin-llama--char-balanced-p
+                                (concat before ghost after) c))))
+                   chars))))
+
 (defun ecoin-llama--postprocess (content &optional keep-indent)
   "Turn the raw server CONTENT into ghost text for point, or nil for none.
+See `ecoin-llama--postprocess-replace' for KEEP-INDENT."
+  (car (ecoin-llama--postprocess-replace content keep-indent)))
+
+(defun ecoin-llama--postprocess-replace (content &optional keep-indent)
+  "Post-process CONTENT into (TEXT . REPLACE-EOL), or nil for no ghost.
+REPLACE-EOL is non-nil when TEXT carries the closers after point, which
+accepting must replace.
 With KEEP-INDENT, put back the indentation removed from a whitespace-only
 line, since the core's dedent step on delivery removes it."
   (let* ((text (replace-regexp-in-string ecoin-llama--leak-regexp "" content t t))
@@ -1132,7 +1184,8 @@ line, since the core's dedent step on delivery removes it."
          (text-after (buffer-substring-no-properties
                        (point) (line-end-position)))
          (blank-line (string-blank-p (concat text-before text-after)))
-         (removed ""))
+         (removed "")
+         (replace nil))
     (while (and rev (string-blank-p (car rev))) (pop rev))
     (when rev
       (setcar rev (string-trim-right (car rev)))
@@ -1149,25 +1202,33 @@ line, since the core's dedent step on delivery removes it."
             (when (string-match-p "[^ \t]" text-after)
               (let ((first (car lines))
                     (tail (string-trim text-after)))
-                (when (and (> (length tail) 0) (string-suffix-p tail first))
+                (when (and (> (length tail) 0) (string-suffix-p tail first)
+                           (not (ecoin-llama--trim-unbalances-p
+                                 text-before first text-after tail)))
                   (setq first (substring first 0 (- (length first)
                                                     (length tail)))))
+                (when (and (equal first (car lines))
+                           (ecoin-llama--replaces-closers-p
+                            text-before first text-after))
+                  (setq replace t))
                 (setq lines (list first))))
             (when (cdr lines)
               (setq lines (ecoin-llama--snip-closers lines next)))
             (let ((out (string-join lines "\n")))
               (when (string-match-p "[^ \t\n]" out)
-                (concat (and keep-indent removed) out)))))))))
+                (cons (concat (and keep-indent removed) out) replace)))))))))
 
 (defun ecoin-llama--items (contents)
   "Convert raw CONTENTS to `ecoin-item's for point; drop empties and duplicates."
   (let ((seen nil) (items nil))
     (dolist (c contents)
-      (when-let* ((text (ecoin-llama--postprocess c t)))
-        (let ((key (string-trim text)))
+      (when-let* ((res (ecoin-llama--postprocess-replace c t)))
+        (let ((key (string-trim (car res))))
           (unless (member key seen)
             (push key seen)
-            (push (ecoin-make-item :text text :backend 'llama) items)))))
+            (push (ecoin-make-item :text (car res) :backend 'llama
+                                   :end (and (cdr res) (line-end-position)))
+                  items)))))
     (nreverse items)))
 
 ;;;; Cache

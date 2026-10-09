@@ -241,6 +241,7 @@ returns, e.g. on a cache hit.  Return a handle for `ecoin-backend-cancel'."
 (defvar-local ecoin--last-tick nil "Tick seen by the previous post-command run.")
 (defvar-local ecoin--timer nil)
 (defvar-local ecoin--overlay nil)
+(defvar-local ecoin--hidden-overlay nil "Invisible overlay over the text the item replaces.")
 (defvar-local ecoin--keymap-overlay nil "Overlay at point carrying `ecoin-completion-map'.")
 (defvar-local ecoin--last-point nil "Point seen by the previous post-command run.")
 (defvar-local ecoin--pending nil "(BACKEND . HANDLE) of the request in flight.")
@@ -590,7 +591,9 @@ TRIGGER is `auto' or `manual'."
   "Show the text of ITEM as ghost text at point."
   (ecoin--delete-overlay)
   (let* ((p (point))
-         (eol (eolp))
+         (end (min (max (or (ecoin-item-end item) p) p) (point-max)))
+         ;; Replacing up to the line end reads like the end of the line.
+         (eol (or (eolp) (and (> end p) (= end (line-end-position)))))
          (ghost (ecoin-item-text item))
          ;; `cursor' does not work on a newline, so a leading one gets a
          ;; visible space in front of it to carry the property.
@@ -604,8 +607,15 @@ TRIGGER is `auto' or `manual'."
     (overlay-put ov 'window (selected-window))
     (overlay-put ov 'priority ecoin-overlay-priority)
     (overlay-put ov 'ecoin-start p)
-    (overlay-put ov 'ecoin-end (copy-marker (max (or (ecoin-item-end item) p) p)))
+    (overlay-put ov 'ecoin-end (copy-marker end))
     (overlay-put ov 'ecoin-item item)
+    ;; Accepting replaces [p, end], so the ghost must not show that text.
+    (when (> end p)
+      (let ((hov (make-overlay p end nil t nil)))
+        (overlay-put hov 'invisible t)
+        (overlay-put hov 'window (selected-window))
+        (overlay-put hov 'priority ecoin-overlay-priority)
+        (setq ecoin--hidden-overlay hov)))
     ;; A `keymap' property at point outranks evil's and corfu's maps whatever
     ;; their load order.
     (overlay-put kov 'keymap ecoin-completion-map)
@@ -630,7 +640,9 @@ TRIGGER is `auto' or `manual'."
     (when-let* ((m (overlay-get ecoin--overlay 'ecoin-end))) (set-marker m nil))
     (delete-overlay ecoin--overlay))
   (when ecoin--keymap-overlay (delete-overlay ecoin--keymap-overlay))
+  (when ecoin--hidden-overlay (delete-overlay ecoin--hidden-overlay))
   (setq ecoin--overlay nil
+        ecoin--hidden-overlay nil
         ecoin--keymap-overlay nil
         ecoin--overlay-active nil))
 
