@@ -1095,6 +1095,59 @@ Reply keys: :status (default 200), :body (plist or string), :delay (seconds),
     (pcase-let ((`(,buffer ,content ,expected) case))
       (should (equal expected (ecoin-llama-test--post buffer content))))))
 
+(defconst ecoin-llama-test--replace-cases
+  '(;; Auto-paired closers the suggestion already carries are replaced.
+    ("feat(|)" "doom): ecoin" t)
+    ("s = \"|\"" "foo\", bar" t)
+    ;; The existing closer closes the suggestion's opener.
+    ("f(|)" "a(b)" nil)
+    ("f(|)" "a" nil)
+    ("s = \"|\"" "foo" nil)
+    ;; The existing trim already handles these.
+    ("f(|)" "a, b)" nil)
+    ("f(|)" "a(b))" nil)
+    ;; Text after point that is not closers is never replaced.
+    ("f(|) + g(x)" "doom)" nil)
+    ("(|) x" "a)" nil)
+    ("f(|)" "\nfoo" nil))
+  "(BUFFER CONTENT REPLACE) for whether accepting replaces the line's tail.")
+
+(ert-deftest ecoin-llama-test-postprocess-replaces-autopaired-closers ()
+  (dolist (case ecoin-llama-test--replace-cases)
+    (pcase-let ((`(,buffer ,content ,expected) case))
+      (with-temp-buffer
+        (insert buffer)
+        (goto-char (point-min))
+        (search-forward "|")
+        (delete-char -1)
+        (let ((res (ecoin-llama--postprocess-replace content)))
+          (should (eq expected (and (cdr res) t))))))))
+
+(ert-deftest ecoin-llama-test-items-end-is-the-line-end-when-replacing ()
+  (with-temp-buffer
+    (insert "a\nfeat()\nb")
+    (goto-char 8)
+    (let ((items (ecoin-llama--items '("doom): x" "other"))))
+      (should (= 9 (ecoin-item-end (car items))))
+      (should (= 9 (line-end-position)))
+      (should (null (ecoin-item-end (cadr items)))))))
+
+(ert-deftest ecoin-llama-test-typed-through-hit-gets-the-end ()
+  (ecoin-llama-test--with-server
+      (ecoin-llama-test--answer (lambda (_) "doom): ecoin"))
+    (ecoin-llama-test--in-buffer "feat()"
+      (goto-char 6)
+      (should (equal "doom): ecoin" (ecoin-llama-test--show)))
+      (should (= (point-max) (ecoin-item-end
+                              (overlay-get ecoin--overlay 'ecoin-item))))
+      (ecoin-dismiss)
+      (insert "d")
+      (ecoin--request 'auto)
+      (should (equal "oom): ecoin" (ecoin-llama-test--ghost)))
+      (should (= 1 (ecoin-llama-test--infills)))
+      (should (= (point-max) (ecoin-item-end
+                              (overlay-get ecoin--overlay 'ecoin-item)))))))
+
 (ert-deftest ecoin-llama-test-postprocess-keep-indent ()
   (should (equal "    " (substring (ecoin-llama-test--post "    |" "        x" t)
                                    0 4)))

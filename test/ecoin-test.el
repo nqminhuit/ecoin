@@ -269,6 +269,94 @@
     (should (equal "bar" (ecoin-test--ghost)))
     (should (= 1 (length ecoin-test--shown)))))
 
+;;;; Text the item replaces
+
+(defun ecoin-test--hidden ()
+  "The buffer text hidden by the ghost's invisible overlay, or nil."
+  (when-let* ((ov (seq-find (lambda (o) (overlay-get o 'invisible))
+                            (overlays-in (point-min) (point-max)))))
+    (buffer-substring-no-properties (overlay-start ov) (overlay-end ov))))
+
+(ert-deftest ecoin-test-an-item-end-hides-the-replaced-text ()
+  (ecoin-test--with-buffer "feat()"
+    (goto-char 6)
+    (setq ecoin-test--items (list (ecoin-test--item "doom)" (point-max))))
+    (ecoin--request 'manual)
+    (should (equal ")" (ecoin-test--hidden)))
+    (should (equal "feat()" (buffer-string)))
+    (should (eq t (ecoin-test--after-string-cursor)))))
+
+(ert-deftest ecoin-test-no-end-or-an-end-at-point-hides-nothing ()
+  (ecoin-test--with-buffer "feat()"
+    (goto-char 6)
+    (setq ecoin-test--items (list (ecoin-test--item "x")))
+    (ecoin--request 'manual)
+    (should-not (ecoin-test--hidden))
+    (setq ecoin-test--items (list (ecoin-test--item "x" 6)))
+    (ecoin--request 'manual)
+    (should-not (ecoin-test--hidden))))
+
+(ert-deftest ecoin-test-an-end-before-line-end-keeps-the-cursor-property ()
+  (ecoin-test--with-buffer "ab cd ef"
+    (goto-char 4)
+    (setq ecoin-test--items (list (ecoin-test--item "X" 6)))
+    (ecoin--request 'manual)
+    (should (equal "cd" (ecoin-test--hidden)))
+    (should (eql 1 (ecoin-test--after-string-cursor)))))
+
+(ert-deftest ecoin-test-accepting-deletes-the-hidden-text ()
+  (ecoin-test--with-buffer "feat()"
+    (goto-char 6)
+    (setq ecoin-test--items (list (ecoin-test--item "doom)" (point-max))))
+    (ecoin--request 'manual)
+    (ecoin-accept)
+    (should (equal "feat(doom)" (buffer-string)))
+    (should-not (ecoin-test--hidden))))
+
+(ert-deftest ecoin-test-dismissing-shows-the-replaced-text-again ()
+  (ecoin-test--with-buffer "feat()"
+    (goto-char 6)
+    (setq ecoin-test--items (list (ecoin-test--item "doom)" (point-max))))
+    (ecoin--request 'manual)
+    (ecoin-dismiss)
+    (should-not (ecoin-test--hidden))
+    (should-not (cl-some (lambda (o) (overlay-get o 'invisible))
+                         (overlays-in (point-min) (point-max))))
+    (should (equal "feat()" (buffer-string)))))
+
+(ert-deftest ecoin-test-a-partial-accept-keeps-the-text-hidden ()
+  (ecoin-test--with-buffer "feat()"
+    (goto-char 6)
+    (setq ecoin-test--items (list (ecoin-test--item "doom): x" (point-max))))
+    (ecoin--request 'manual)
+    (ecoin-accept-word)
+    (should (equal "feat(doom)" (buffer-string)))
+    (should (equal ")" (ecoin-test--hidden)))
+    (should (equal "): x" (ecoin-test--ghost)))
+    (ecoin-accept)
+    (should (equal "feat(doom): x" (buffer-string)))))
+
+(ert-deftest ecoin-test-typing-the-ghost-keeps-the-text-hidden ()
+  (ecoin-test--with-buffer "feat()"
+    (goto-char 6)
+    (setq ecoin-test--items (list (ecoin-test--item "do)" (point-max))))
+    (ecoin--request 'manual)
+    (let ((this-command 'self-insert-command))
+      (insert "d")
+      (should (ecoin--typed-into-ghost)))
+    (should (equal "o)" (ecoin-test--ghost)))
+    (should (equal ")" (ecoin-test--hidden)))
+    (let ((this-command 'self-insert-command))
+      (insert "o")
+      (should (ecoin--typed-into-ghost)))
+    (should (equal ")" (ecoin-test--hidden)))
+    ;; Auto-pair overtyping moves over the hidden closer without inserting.
+    (let ((this-command 'self-insert-command))
+      (forward-char 1)
+      (should (ecoin--typed-into-ghost)))
+    (should-not (ecoin-test--ghost))
+    (should (equal "feat(do)" (buffer-string)))))
+
 ;;;; Dispatch and lazy loading
 
 (ert-deftest ecoin-test-status-dispatches-to-the-backend ()
